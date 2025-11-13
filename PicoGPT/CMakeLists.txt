@@ -1,71 +1,110 @@
-# Generated Cmake Pico project file
+cmake_minimum_required(VERSION 3.12)
 
-cmake_minimum_required(VERSION 3.13)
+# Project configuration
+project(PicoGPT C)
 
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# Set C standard
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# Initialise pico_sdk from installed location
-# (note this can come from environment, CMake cache etc)
+# Add compiler flags for debugging and warnings
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -g")
 
-# == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
-if(WIN32)
-    set(USERHOME $ENV{USERPROFILE})
-else()
-    set(USERHOME $ENV{HOME})
-endif()
-set(sdkVersion 2.2.0)
-set(toolchainVersion 14_2_Rel1)
-set(picotoolVersion 2.2.0)
-set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
-if (EXISTS ${picoVscode})
-    include(${picoVscode})
-endif()
-# ====================================================================================
-set(PICO_BOARD pico2 CACHE STRING "Board type")
+# Create stub headers directory
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/stubs)
 
+# Create stub header files for Pico SDK
+file(WRITE ${CMAKE_BINARY_DIR}/stubs/pico/stdlib.h "
+#ifndef PICO_STDLIB_H
+#define PICO_STDLIB_H
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include <time.h>
 
-# Pull in Raspberry Pi Pico SDK (must be before project)
-include(pico_sdk_import.cmake)
+// Stub implementations for Linux
+static inline void stdio_init_all(void) {
+    // No-op for Linux
+}
 
-project(PicoGPT C CXX ASM)
+static inline void sleep_ms(uint32_t ms) {
+    usleep(ms * 1000);
+}
 
-# Initialise the Raspberry Pi Pico SDK
-pico_sdk_init()
+typedef uint32_t alarm_id_t;
+typedef int64_t (*alarm_callback_t)(alarm_id_t id, void *user_data);
 
-# Add executable. Default name is the project name, version 0.1
+static inline alarm_id_t add_alarm_in_ms(uint32_t ms, alarm_callback_t callback, void *user_data, bool fire_if_past) {
+    // Stub implementation - just return 0
+    (void)ms; (void)callback; (void)user_data; (void)fire_if_past;
+    return 0;
+}
 
-add_executable(PicoGPT PicoGPT.c attention_test.c)
+static inline uint64_t time_us_64(void) {
+    // Return time in microseconds using clock()
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
 
-target_compile_definitions(PicoGPT PRIVATE ON_TARGET)
+#endif
+")
 
-pico_set_program_name(PicoGPT "PicoGPT")
-pico_set_program_version(PicoGPT "0.1")
+file(WRITE ${CMAKE_BINARY_DIR}/stubs/hardware/timer.h "
+#ifndef HARDWARE_TIMER_H
+#define HARDWARE_TIMER_H
 
-# no_flash means the target is to run from RAM
-pico_set_binary_type(PicoGPT no_flash)
+#include <stdint.h>
+#include <stdbool.h>
 
-# Modify the below lines to enable/disable output over UART/USB
-pico_enable_stdio_uart(PicoGPT 0)
-pico_enable_stdio_usb(PicoGPT 1)
+// Stub definitions for timer functionality
+typedef uint32_t alarm_id_t;
+typedef int64_t (*alarm_callback_t)(alarm_id_t id, void *user_data);
 
+#endif
+")
 
-# Add the standard library to the build
-target_link_libraries(PicoGPT
-        pico_stdlib)
+file(WRITE ${CMAKE_BINARY_DIR}/stubs/hardware/clocks.h "
+#ifndef HARDWARE_CLOCKS_H
+#define HARDWARE_CLOCKS_H
 
-# Add the standard include files to the build
-target_include_directories(PicoGPT PRIVATE
-        ${CMAKE_CURRENT_LIST_DIR}
+#include <stdint.h>
+
+// Stub definitions for clock functionality
+typedef enum {
+    clk_sys,
+    clk_usb
+} clock_index_t;
+
+static inline uint32_t clock_get_hz(clock_index_t clock) {
+    // Return dummy values for Linux testing
+    switch(clock) {
+        case clk_sys: return 125000000; // 125 MHz
+        case clk_usb: return 48000000;  // 48 MHz
+        default: return 0;
+    }
+}
+
+#endif
+")
+
+# Add include directories
+include_directories(${CMAKE_BINARY_DIR}/stubs)
+include_directories(${CMAKE_SOURCE_DIR})
+
+# Add executable
+add_executable(PicoGPT
+    PicoGPT.c
+    attention_test.c
 )
 
-# Add any user requested libraries
-target_link_libraries(PicoGPT 
-        hardware_timer
-        hardware_clocks
-        )
+# Link math library
+target_link_libraries(PicoGPT m)
 
-pico_add_extra_outputs(PicoGPT)
-
+# Set output directory
+set_target_properties(PicoGPT PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+)

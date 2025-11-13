@@ -1,0 +1,238 @@
+#ifndef GPT_UTILS_H
+#define GPT_UTILS_H
+
+#include <math.h>
+#include <stdint.h>
+#include <stddef.h>
+
+// Mathematical constants
+#define GPT_PI 3.14159265358979323846f
+#define GPT_E  2.71828182845904523536f
+
+/**
+ * GELU activation function (moved to constants to avoid redefinition)
+ * Using the version from gpt_constants.h
+ */
+
+/**
+ * Fast approximation of GELU
+ * GELU(x) ≈ 0.5 * x * (1 + tanh(0.7978845608 * (x + 0.044715 * x^3)))
+ */
+static inline float gelu_fast(float x) {
+    return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
+}
+
+/**
+ * Softmax function for a vector
+ * Numerically stable version using max subtraction
+ */
+static inline void softmax(float* input, float* output, size_t length) {
+    // Find maximum value for numerical stability
+    float max_val = input[0];
+    for (size_t i = 1; i < length; i++) {
+        if (input[i] > max_val) {
+            max_val = input[i];
+        }
+    }
+    
+    // Compute exponentials and sum
+    float sum = 0.0f;
+    for (size_t i = 0; i < length; i++) {
+        output[i] = expf(input[i] - max_val);
+        sum += output[i];
+    }
+    
+    // Normalize
+    for (size_t i = 0; i < length; i++) {
+        output[i] /= sum;
+    }
+}
+
+/**
+ * In-place softmax
+ */
+static inline void softmax_inplace(float* data, size_t length) {
+    softmax(data, data, length);
+}
+
+/**
+ * Layer normalization
+ * output = gamma * (input - mean) / sqrt(variance + epsilon) + beta
+ */
+static inline void layer_norm(
+    const float* input,           // Input tensor [seq_len, embed_dim]
+    float* output,                // Output tensor [seq_len, embed_dim]
+    const float* gamma,           // Scale parameters [embed_dim]
+    const float* beta,            // Bias parameters [embed_dim]
+    size_t seq_len,
+    size_t embed_dim,
+    float epsilon
+) {
+    for (size_t seq = 0; seq < seq_len; seq++) {
+        const float* input_row = input + seq * embed_dim;
+        float* output_row = output + seq * embed_dim;
+        
+        // Compute mean
+        float mean = 0.0f;
+        for (size_t i = 0; i < embed_dim; i++) {
+            mean += input_row[i];
+        }
+        mean /= embed_dim;
+        
+        // Compute variance
+        float variance = 0.0f;
+        for (size_t i = 0; i < embed_dim; i++) {
+            float diff = input_row[i] - mean;
+            variance += diff * diff;
+        }
+        variance /= embed_dim;
+        
+        // Normalize
+        float inv_std = 1.0f / sqrtf(variance + epsilon);
+        for (size_t i = 0; i < embed_dim; i++) {
+            output_row[i] = gamma[i] * (input_row[i] - mean) * inv_std + beta[i];
+        }
+    }
+}
+
+/**
+ * Matrix multiplication: C = A * B
+ * A: [rows_a, cols_a]
+ * B: [cols_a, cols_b] 
+ * C: [rows_a, cols_b]
+ */
+static inline void matmul(
+    const float* A, size_t rows_a, size_t cols_a,
+    const float* B, size_t cols_b,
+    float* C
+) {
+    for (size_t i = 0; i < rows_a; i++) {
+        for (size_t j = 0; j < cols_b; j++) {
+            float sum = 0.0f;
+            for (size_t k = 0; k < cols_a; k++) {
+                sum += A[i * cols_a + k] * B[k * cols_b + j];
+            }
+            C[i * cols_b + j] = sum;
+        }
+    }
+}
+
+/**
+ * Matrix multiplication with bias addition: C = A * B + bias
+ * bias is broadcasted across all rows
+ */
+static inline void matmul_bias(
+    const float* A, size_t rows_a, size_t cols_a,
+    const float* B, size_t cols_b,
+    const float* bias,
+    float* C
+) {
+    matmul(A, rows_a, cols_a, B, cols_b, C);
+    
+    // Add bias
+    if (bias) {
+        for (size_t i = 0; i < rows_a; i++) {
+            for (size_t j = 0; j < cols_b; j++) {
+                C[i * cols_b + j] += bias[j];
+            }
+        }
+    }
+}
+
+/**
+ * Element-wise addition: C = A + B
+ */
+static inline void add_tensors(
+    const float* A,
+    const float* B,
+    float* C,
+    size_t length
+) {
+    for (size_t i = 0; i < length; i++) {
+        C[i] = A[i] + B[i];
+    }
+}
+
+/**
+ * Copy tensor data
+ */
+static inline void copy_tensor(
+    const float* src,
+    float* dst,
+    size_t length
+) {
+    for (size_t i = 0; i < length; i++) {
+        dst[i] = src[i];
+    }
+}
+
+/**
+ * Zero out tensor data
+ */
+static inline void zero_tensor(float* data, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        data[i] = 0.0f;
+    }
+}
+
+/**
+ * Apply GELU activation to entire tensor
+ */
+static inline void apply_gelu(float* data, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        data[i] = gelu_activation(data[i]);
+    }
+}
+
+/**
+ * Transpose a 2D matrix in-place (only works for square matrices)
+ * For non-square matrices, use transpose_matrix
+ */
+static inline void transpose_square_matrix(float* matrix, size_t size) {
+    for (size_t i = 0; i < size; i++) {
+        for (size_t j = i + 1; j < size; j++) {
+            float temp = matrix[i * size + j];
+            matrix[i * size + j] = matrix[j * size + i];
+            matrix[j * size + i] = temp;
+        }
+    }
+}
+
+/**
+ * Transpose a 2D matrix: output = input^T
+ * input: [rows, cols]
+ * output: [cols, rows]
+ */
+static inline void transpose_matrix(
+    const float* input, size_t rows, size_t cols,
+    float* output
+) {
+    for (size_t i = 0; i < rows; i++) {
+        for (size_t j = 0; j < cols; j++) {
+            output[j * rows + i] = input[i * cols + j];
+        }
+    }
+}
+
+/**
+ * Print tensor for debugging (first few elements)
+ */
+static inline void print_tensor_debug(
+    const char* name,
+    const float* data,
+    size_t length,
+    size_t max_print
+) {
+    printf("%s: [", name);
+    size_t print_len = length < max_print ? length : max_print;
+    for (size_t i = 0; i < print_len; i++) {
+        printf("%.4f", data[i]);
+        if (i < print_len - 1) printf(", ");
+    }
+    if (length > max_print) {
+        printf(", ... (%zu total)", length);
+    }
+    printf("]\n");
+}
+
+#endif // GPT_UTILS_H

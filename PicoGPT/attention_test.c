@@ -386,11 +386,12 @@ static void run_attention_head(const q8_t input[SEQ_LEN][DIM],
 static int dump_output_to_file(const char *filename,
                                const q8_t data[SEQ_LEN][DIM])
 {
-    FILE *f = fopen(filename, "wb");
-    if (!f) return -1;
-    size_t written = fwrite(data, sizeof(q8_t), SEQ_LEN * DIM, f);
-    fclose(f);
-    return (written == SEQ_LEN * DIM) ? 0 : -1;
+    // FILE *f = fopen(filename, "wb");
+    // if (!f) return -1;
+    // size_t written = fwrite(data, sizeof(q8_t), SEQ_LEN * DIM, f);
+    // fclose(f);
+    // return (written == SEQ_LEN * DIM) ? 0 : -1;
+    return 0;
 }
 
 /* Create deterministic dummy data for testing.  This helper fills the
@@ -452,12 +453,12 @@ int attention_test(void)
 
     /* Measure runtime. */
     //clock_t start = clock();
-    int64_t start = time_us_64(); 
+    // int64_t start = time_us_64(); 
     run_attention_head(input, w_qkv, w_fc1, w_fc2, output);
-    int64_t elapsed = time_us_64() - start;
-    //clock_t end = clock();
-    //double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
-    printf("Attention head forward pass took %lld microseconds on host.\n", elapsed);
+    // int64_t elapsed = time_us_64() - start;
+    // //clock_t end = clock();
+    // //double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
+    // printf("Attention head forward pass took %lld microseconds on host.\n", elapsed);
 
 #ifndef ON_TARGET
     /* Dump output to file for offline verification. */

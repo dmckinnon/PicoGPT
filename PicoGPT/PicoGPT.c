@@ -23,8 +23,8 @@ int main()
     // For more examples of timer use see https://github.com/raspberrypi/pico-examples/tree/master/timer
     while (true) {
 
-    printf("System Clock Frequency is %d Hz\n", clock_get_hz(clk_sys));
-    printf("USB Clock Frequency is %d Hz\n", clock_get_hz(clk_usb));
+    // printf("System Clock Frequency is %d Hz\n", clock_get_hz(clk_sys));
+    // printf("USB Clock Frequency is %d Hz\n", clock_get_hz(clk_usb));
     // For more examples of clocks use see https://github.com/raspberrypi/pico-examples/tree/master/clocks
 
     // 32 ms per attention head
