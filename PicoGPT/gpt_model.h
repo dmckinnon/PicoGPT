@@ -150,6 +150,7 @@ static inline float* gpt_forward(
         seq_len, config->embed_dim
     );
     
+    // this output is in embedding space
     return final_output;
 }
 
@@ -227,7 +228,7 @@ static inline float* gpt_inference(
     if (!next_token_logits) {
         return NULL;
     }
-    
+
     // Copy logits for last position
     const float* last_logits = all_logits + (seq_len - 1) * config->vocab_size;
     copy_tensor(last_logits, next_token_logits, config->vocab_size);

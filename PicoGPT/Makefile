@@ -132,17 +132,17 @@ sizes:
 		ls -lh $(TARGET) | awk '{print $$5 "\t" $$9}'; \
 	fi
 
-# Generate documentation (requires doxygen)
-docs:
-	@echo "Generating documentation..."
-	@echo "PROJECT_NAME = \"GPT Model Implementation\"" > Doxyfile.tmp
-	@echo "INPUT = ." >> Doxyfile.tmp
-	@echo "FILE_PATTERNS = *.h *.c" >> Doxyfile.tmp
-	@echo "GENERATE_HTML = YES" >> Doxyfile.tmp
-	@echo "OUTPUT_DIRECTORY = docs" >> Doxyfile.tmp
-	@doxygen Doxyfile.tmp
-	@rm Doxyfile.tmp
-	@echo "Documentation generated in docs/ directory"
+# # Generate documentation (requires doxygen)
+# docs:
+# 	@echo "Generating documentation..."
+# 	@echo "PROJECT_NAME = \"GPT Model Implementation\"" > Doxyfile.tmp
+# 	@echo "INPUT = ." >> Doxyfile.tmp
+# 	@echo "FILE_PATTERNS = *.h *.c" >> Doxyfile.tmp
+# 	@echo "GENERATE_HTML = YES" >> Doxyfile.tmp
+# 	@echo "OUTPUT_DIRECTORY = docs" >> Doxyfile.tmp
+# 	@doxygen Doxyfile.tmp
+# 	@rm Doxyfile.tmp
+# 	@echo "Documentation generated in docs/ directory"
 
 # Performance test with different sequence lengths
 perf-test: $(TARGET)

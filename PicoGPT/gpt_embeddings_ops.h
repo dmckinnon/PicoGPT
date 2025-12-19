@@ -102,6 +102,7 @@ static inline float* embedding_op(
     }
     
     // Perform embedding lookup
+    // this feels like an unnecessary extra layer
     embedding_lookup(token_ids, embeddings, seq_len);
     
     return embeddings;

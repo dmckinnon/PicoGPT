@@ -66,7 +66,7 @@ static inline void scaled_dot_product_attention(
 ) {
     const float scale = INV_SQRT_HEAD_DIM; // 1/sqrt(embed_dim)
     
-    // Compute Q * K^T
+    // Compute Q * K^T / root(embed_dim)
     // query: [seq_len, embed_dim], key^T: [embed_dim, seq_len] -> scores: [seq_len, seq_len]
     for (size_t i = 0; i < seq_len; i++) {
         for (size_t j = 0; j < seq_len; j++) {
@@ -164,6 +164,7 @@ static inline float* multi_head_attention(
                                 attention_scores, seq_len, embed_dim);
     
     // Step 3: Output Projection
+    // What is this ... 
     attention_output_projection(attention_output, output_weights, final_output, 
                                seq_len, embed_dim);
     
