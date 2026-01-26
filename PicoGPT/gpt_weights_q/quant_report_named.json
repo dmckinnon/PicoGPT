@@ -1,0 +1,177 @@
+{
+  "mode": "per_tensor",
+  "description": "Per-tensor symmetric int8 quantization",
+  "tensors": {
+    "layer1_ffn_up": {
+      "scale": 0.0015713966737581988,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        32,
+        128
+      ],
+      "original_name": "arith.constant1"
+    },
+    "layer1_ffn_down": {
+      "scale": 0.0023392427155352015,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        128,
+        32
+      ],
+      "original_name": "arith.constant2"
+    },
+    "layer1_attn_out": {
+      "scale": 0.0011225661893529216,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        32,
+        32
+      ],
+      "original_name": "arith.constant3"
+    },
+    "layer1_attn_qkv": {
+      "scale": 0.0030089086434972566,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        96,
+        32
+      ],
+      "original_name": "arith.constant4"
+    },
+    "layer2_ffn_up": {
+      "scale": 0.0012151135469046165,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        32,
+        128
+      ],
+      "original_name": "arith.constant5"
+    },
+    "layer2_ffn_down": {
+      "scale": 0.0016160527552206685,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        128,
+        32
+      ],
+      "original_name": "arith.constant6"
+    },
+    "layer2_attn_out": {
+      "scale": 0.0012012073608833973,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        32,
+        32
+      ],
+      "original_name": "arith.constant7"
+    },
+    "layer2_attn_qkv": {
+      "scale": 0.0034227957875709834,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        96,
+        32
+      ],
+      "original_name": "arith.constant8"
+    },
+    "token_embedding": {
+      "scale": 0.004909847195692888,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        47,
+        32
+      ],
+      "original_name": "arith.constant9"
+    },
+    "position_embedding": {
+      "scale": 0.001914863980661227,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        31,
+        32
+      ],
+      "original_name": "model_1/tf.math.add_107/Add/y"
+    },
+    "attention_mask": {
+      "scale": 1.0,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        31,
+        31
+      ],
+      "original_name": "arith.constant13"
+    },
+    "layer1_ln_beta": {
+      "scale": 0.008945738236735187,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        32
+      ],
+      "original_name": "model_1/tf.math.multiply_102/Mul/y"
+    },
+    "layer2_ln_gamma": {
+      "scale": 0.009786518539969377,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        32
+      ],
+      "original_name": "model_1/tf.math.multiply_105/Mul/y"
+    },
+    "layer2_ln_beta": {
+      "scale": 0.011104425107400248,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        32
+      ],
+      "original_name": "model_1/tf.math.multiply_110/Mul/y"
+    },
+    "final_ln_gamma": {
+      "scale": 0.02031213842977689,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        32
+      ],
+      "original_name": "model_1/tf.math.multiply_113/Mul/y"
+    },
+    "layer1_ln_gamma": {
+      "scale": 0.009855096734414889,
+      "zero_point": 0,
+      "qmin": -128,
+      "qmax": 127,
+      "shape": [
+        32
+      ],
+      "original_name": "model_1/tf.math.multiply_97/Mul/y"
+    }
+  }
+}

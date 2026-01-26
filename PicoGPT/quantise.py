@@ -28,6 +28,9 @@ python tflite_weight_ptq.py \
   --num_samples 128 \
   --compare
 
+  Tried this, resulted in confusingly named files, filled with zeroes
+  Model file looks fine, weights are just buggered. Try per tensor
+
 # 2) Per-tensor weight quantization, random representative inputs, write header only
 python tflite_weight_ptq.py \
   --tflite_in model_fp32.tflite \
@@ -35,6 +38,14 @@ python tflite_weight_ptq.py \
   --mode per_tensor \
   --num_samples 64 \
   --seed 0
+
+This appeared to work better, just need to pull out the quant data and associate with each tensor 
+like extract weights, to take it into account
+Next question: how can we transfer quantisations across ops? I'd like to avoid dequant and requant
+This does not export the model with quanted weights
+
+We need to associate the quantisation params with the sets of weights, and also
+apply the quantisations to all the weights so they are default 8 bit
 
 Representative data formats:
 - --rep_npy_dir: directory containing .npy files. Each file can be:
@@ -190,9 +201,9 @@ def model_to_object(model_bytes: bytes) -> schema_fb.ModelT:
     return model_obj
 
 def object_to_model_bytes(model_obj: schema_fb.ModelT) -> bytes:
-    builder = flatbuffers.Builder(0)
+    builder = flatbuffers.Builder(1024 * 1024)  # Pre-allocate 1MB
     off = model_obj.Pack(builder)
-    builder.Finish(off)
+    builder.Finish(off, b"TFL3")  # TFLite file identifier
     return bytes(builder.Output())
 
 def find_float32_constant_weight_tensors(model_obj: schema_fb.ModelT) -> List[WeightTensorInfo]:
@@ -212,7 +223,7 @@ def find_float32_constant_weight_tensors(model_obj: schema_fb.ModelT) -> List[We
             if data is None or len(data) == 0:
                 continue
             name = t.name.decode("utf-8") if isinstance(t.name, (bytes, bytearray)) else (t.name or f"tensor_{t_i}")
-            shape = [int(d) for d in (t.shape or [])]
+            shape = [int(d) for d in t.shape] if t.shape is not None else []
             out.append(WeightTensorInfo(subgraph_idx=sg_i, tensor_idx=t_i, tensor_name=name, shape=shape, buffer_idx=buf_i))
     return out
 
@@ -638,8 +649,11 @@ def main():
             print(f"Wrote fake-quantized TFLite: {fakeq_path}")
 
         if args.compare:
-            # Compare via Interpreter-from-bytes
-            interp_test = tf.lite.Interpreter(model_content=fake_bytes)
+            # Compare via Interpreter - load from file if available, otherwise from bytes
+            if fakeq_path:
+                interp_test = tf.lite.Interpreter(model_path=fakeq_path)
+            else:
+                interp_test = tf.lite.Interpreter(model_content=fake_bytes)
             interp_test.allocate_tensors()
 
             test_outputs, test_hists, test_minmax = run_inference_collect(
