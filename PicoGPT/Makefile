@@ -2,6 +2,7 @@
 # Builds the complete C implementation from TensorFlow Lite weights
 
 CC = gcc
+PYTHON ?= python3
 CFLAGS = -Wall -Wextra -O2 -std=c99
 LDFLAGS = -lm
 DEBUG_FLAGS = -g -O0 -DDEBUG
@@ -84,6 +85,12 @@ test: simple_test
 quick-test: simple_test
 	./simple_test
 
+parity-test:
+	CC="$(CC)" CFLAGS="$(CFLAGS)" $(PYTHON) -B -m unittest discover -s tests -v
+
+extract-weights:
+	$(PYTHON) -B extract_weights_enhanced.py
+
 # Create a minimal version (single header file)
 single-header: $(HEADERS) $(SOURCE)
 	@echo "Creating single header file..."
@@ -164,6 +171,8 @@ help:
 	@echo "  run          - Build and run the program"
 	@echo "  run-debug    - Build and run debug version"
 	@echo "  test-O*      - Build with different optimization levels"
+	@echo "  parity-test  - Compare C logits/intermediates with TFLite (requires Python dependencies)"
+	@echo "  extract-weights - Regenerate C headers from the TFLite graph"
 	@echo "  profile      - Build with profiling and generate report"
 	@echo "  memcheck     - Run with valgrind memory checking"
 	@echo "  static-check - Run static analysis with cppcheck"
@@ -177,4 +186,4 @@ help:
 	@echo "  install      - Install to system (requires sudo)"
 	@echo "  help         - Show this help message"
 
-.PHONY: all debug run run-debug clean single-header single check-headers sizes docs perf-test install help memcheck static-check profile test-O0 test-O1 test-O2 test-O3
+.PHONY: all debug run run-debug clean single-header single check-headers sizes docs perf-test install help memcheck static-check profile test-O0 test-O1 test-O2 test-O3 test quick-test parity-test extract-weights

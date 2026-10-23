@@ -27,7 +27,7 @@ static inline void qkv_projection(
     size_t embed_dim
 ) {
     // QKV weights are arranged as [Q_weights; K_weights; V_weights]
-    // Each sub-matrix is [embed_dim, embed_dim]
+    // Each sub-matrix is [input_dim, output_dim], transposed during extraction.
     
     const float* q_weights = qkv_weights;                           // [0:embed_dim, :]
     const float* k_weights = qkv_weights + embed_dim * embed_dim;   // [embed_dim:2*embed_dim, :]
@@ -164,7 +164,6 @@ static inline float* multi_head_attention(
                                 attention_scores, seq_len, embed_dim);
     
     // Step 3: Output Projection
-    // What is this ... 
     attention_output_projection(attention_output, output_weights, final_output, 
                                seq_len, embed_dim);
     

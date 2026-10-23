@@ -66,8 +66,8 @@ static inline float* transformer_layer(
         // Layer 1 weights
         ln_gamma_1 = layer1_ln_gamma;
         ln_beta_1 = layer1_ln_beta;
-        ln_gamma_2 = layer1_ln_gamma; // Reuse for FFN layer norm (model may have separate weights)
-        ln_beta_2 = layer1_ln_beta;
+        ln_gamma_2 = layer1_ffn_ln_gamma;
+        ln_beta_2 = layer1_ffn_ln_beta;
         attn_qkv = (const float*)layer1_attn_qkv;
         attn_out = (const float*)layer1_attn_out;
         ffn_up = (const float*)layer1_ffn_up;
@@ -76,8 +76,8 @@ static inline float* transformer_layer(
         // Layer 2 weights
         ln_gamma_1 = layer2_ln_gamma;
         ln_beta_1 = layer2_ln_beta;
-        ln_gamma_2 = layer2_ln_gamma;
-        ln_beta_2 = layer2_ln_beta;
+        ln_gamma_2 = layer2_ffn_ln_gamma;
+        ln_beta_2 = layer2_ffn_ln_beta;
         attn_qkv = (const float*)layer2_attn_qkv;
         attn_out = (const float*)layer2_attn_out;
         ffn_up = (const float*)layer2_ffn_up;
@@ -146,7 +146,7 @@ static inline float* gpt_forward(
     
     // 3. Final layer normalization
     float* final_output = layer_norm_alloc(
-        arena, current_output, final_ln_gamma, final_ln_gamma, // Note: using gamma as beta placeholder
+        arena, current_output, final_ln_gamma, final_ln_beta,
         seq_len, config->embed_dim
     );
     
