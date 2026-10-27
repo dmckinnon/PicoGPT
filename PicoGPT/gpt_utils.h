@@ -9,6 +9,10 @@
 #define GPT_PI 3.14159265358979323846f
 #define GPT_E  2.71828182845904523536f
 
+#ifndef GPT_MATMUL_UNROLL4
+#define GPT_MATMUL_UNROLL4 0
+#endif
+
 /**
  * GELU activation function (moved to constants to avoid redefinition)
  * Using the version from gpt_constants.h
@@ -101,7 +105,7 @@ static inline void layer_norm(
  * B: [cols_a, cols_b] 
  * C: [rows_a, cols_b]
  */
-static inline void matmul(
+static inline void matmul_baseline(
     const float* A, size_t rows_a, size_t cols_a,
     const float* B, size_t cols_b,
     float* C
@@ -115,6 +119,53 @@ static inline void matmul(
             C[i * cols_b + j] = sum;
         }
     }
+}
+
+static inline void matmul_unroll4(
+    const float* A, size_t rows_a, size_t cols_a,
+    const float* B, size_t cols_b,
+    float* C
+) {
+    for (size_t i = 0; i < rows_a; i++) {
+        const float* row = A + i * cols_a;
+        float* output = C + i * cols_b;
+        size_t j = 0;
+        for (; cols_b - j >= 4; j += 4) {
+            float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+            for (size_t k = 0; k < cols_a; k++) {
+                float a = row[k];
+                const float* weights = B + k * cols_b + j;
+                sum0 += a * weights[0];
+                sum1 += a * weights[1];
+                sum2 += a * weights[2];
+                sum3 += a * weights[3];
+            }
+            output[j] = sum0;
+            output[j + 1] = sum1;
+            output[j + 2] = sum2;
+            output[j + 3] = sum3;
+        }
+        for (; j < cols_b; j++) {
+            float sum = 0.0f;
+            for (size_t k = 0; k < cols_a; k++) {
+                sum += row[k] * B[k * cols_b + j];
+            }
+            output[j] = sum;
+        }
+    }
+}
+
+/* Neither kernel supports output overlapping either input. */
+static inline void matmul(
+    const float* A, size_t rows_a, size_t cols_a,
+    const float* B, size_t cols_b,
+    float* C
+) {
+#if GPT_MATMUL_UNROLL4
+    matmul_unroll4(A, rows_a, cols_a, B, cols_b, C);
+#else
+    matmul_baseline(A, rows_a, cols_a, B, cols_b, C);
+#endif
 }
 
 /**

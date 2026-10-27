@@ -13,8 +13,11 @@
 
 #define ARENA_SIZE (144 * 1024)
 #define NEW_TOKENS 100
+#define MATMUL_REPEATS 10
+#define MATMUL_SAMPLES 5
 
 static _Alignas(8) uint8_t arena_memory[ARENA_SIZE];
+static volatile float matmul_benchmark_sink;
 
 /* TFLite logits for IDs 0..30, with its final GATHER index corrected to 30. */
 static const float reference_logits[VOCAB_SIZE] = {
@@ -27,6 +30,114 @@ static const float reference_logits[VOCAB_SIZE] = {
     -8.419454694e-01f, -3.256937265e+00f, 2.225280106e-01f, 2.220644236e+00f, -3.710196316e-01f, -1.906719446e+00f,
     -2.463572264e+00f, 2.330612898e+00f, -1.479536414e+00f, 2.650636435e-01f, -4.853814125e+00f,
 };
+
+typedef void (*MatmulKernel)(const float*, size_t, size_t, const float*, size_t, float*);
+
+/* Keep both benchmark kernels out of line, with the same call overhead. */
+static __attribute__((noinline, noclone)) void benchmark_baseline(
+    const float* a, size_t rows, size_t inner, const float* b, size_t columns, float* output
+) {
+    matmul_baseline(a, rows, inner, b, columns, output);
+}
+
+static __attribute__((noinline, noclone)) void benchmark_unroll4(
+    const float* a, size_t rows, size_t inner, const float* b, size_t columns, float* output
+) {
+    matmul_unroll4(a, rows, inner, b, columns, output);
+}
+
+static __attribute__((noinline, noclone)) uint64_t time_matmul(
+    MatmulKernel kernel, const float* input, size_t rows, size_t inner,
+    const float* weights, size_t columns, float* output
+) {
+    uint64_t start = time_us_64();
+    for (size_t repeat = 0; repeat < MATMUL_REPEATS; repeat++) {
+        kernel(input, rows, inner, weights, columns, output);
+        matmul_benchmark_sink = output[repeat % (rows * columns)];
+    }
+    return time_us_64() - start;
+}
+
+static uint64_t median_matmul_time(uint64_t samples[MATMUL_SAMPLES]) {
+    for (size_t i = 1; i < MATMUL_SAMPLES; i++) {
+        for (size_t j = i; j > 0 && samples[j] < samples[j - 1]; j--) {
+            uint64_t swap = samples[j];
+            samples[j] = samples[j - 1];
+            samples[j - 1] = swap;
+        }
+    }
+    return samples[MATMUL_SAMPLES / 2];
+}
+
+static bool benchmark_matmul(Arena* arena) {
+    const struct {
+        const char* name;
+        size_t inner;
+        size_t columns;
+        const float* weights;
+    } shapes[] = {
+        {"attention", EMBED_DIM, EMBED_DIM, (const float*)layer1_attn_qkv},
+        {"FFN up", EMBED_DIM, FFN_DIM, (const float*)layer1_ffn_up},
+        {"FFN down", FFN_DIM, EMBED_DIM, (const float*)layer1_ffn_down},
+    };
+    const size_t lengths[] = {1, MAX_SEQ_LEN};
+    printf("\nMatmul A/B: median of %d batches x %d calls; alternating order; interrupts enabled.\n",
+           MATMUL_SAMPLES, MATMUL_REPEATS);
+    for (size_t shape = 0; shape < sizeof(shapes) / sizeof(shapes[0]); shape++) {
+        size_t inner = shapes[shape].inner, columns = shapes[shape].columns;
+        for (size_t length = 0; length < sizeof(lengths) / sizeof(lengths[0]); length++) {
+            size_t rows = lengths[length];
+            arena_reset(arena);
+            float* input = arena_alloc_tensor_2d(arena, rows, inner);
+            float* baseline = arena_alloc_tensor_2d(arena, rows, columns);
+            float* unrolled = arena_alloc_tensor_2d(arena, rows, columns);
+            if (!input || !baseline || !unrolled) {
+                printf("ERROR: insufficient arena for matmul benchmark.\n");
+                return false;
+            }
+            for (size_t i = 0; i < rows * inner; i++) {
+                input[i] = (float)((int)(i % 31) - 15) / 17.0f;
+            }
+            for (size_t i = 0; i < rows * columns; i++) {
+                baseline[i] = unrolled[i] = NAN;
+            }
+            benchmark_baseline(input, rows, inner, shapes[shape].weights, columns, baseline);
+            benchmark_unroll4(input, rows, inner, shapes[shape].weights, columns, unrolled);
+            for (size_t i = 0; i < rows * columns; i++) {
+                if (!isfinite(baseline[i]) || !isfinite(unrolled[i]) || baseline[i] != unrolled[i]) {
+                    printf("ERROR: matmul mismatch in %s, M=%zu at output %zu.\n",
+                           shapes[shape].name, rows, i);
+                    return false;
+                }
+            }
+            uint64_t baseline_times[MATMUL_SAMPLES], unrolled_times[MATMUL_SAMPLES];
+            for (size_t sample = 0; sample < MATMUL_SAMPLES; sample++) {
+                for (size_t turn = 0; turn < 2; turn++) {
+                    bool use_unrolled = ((sample + turn) % 2) != 0;
+                    uint64_t elapsed = time_matmul(
+                        use_unrolled ? benchmark_unroll4 : benchmark_baseline,
+                        input, rows, inner, shapes[shape].weights, columns, baseline
+                    );
+                    if (use_unrolled) unrolled_times[sample] = elapsed;
+                    else baseline_times[sample] = elapsed;
+                }
+            }
+            uint64_t baseline_us = median_matmul_time(baseline_times);
+            uint64_t unrolled_us = median_matmul_time(unrolled_times);
+            if (!baseline_us || !unrolled_us) {
+                printf("ERROR: matmul timing below timer resolution; increase MATMUL_REPEATS.\n");
+                return false;
+            }
+            printf("  %s M=%zu K=%zu N=%zu: baseline %.3f us/call, unroll4 %.3f us/call, speedup %.3fx; outputs MATCH.\n",
+                   shapes[shape].name, rows, inner, columns,
+                   (double)baseline_us / MATMUL_REPEATS, (double)unrolled_us / MATMUL_REPEATS,
+                   (double)baseline_us / (double)unrolled_us);
+        }
+    }
+    arena_reset(arena);
+    pico_memory_sample();
+    return true;
+}
 
 static float* infer(Arena* arena, const GPTConfig* config, const int32_t* tokens,
                     size_t length, size_t* peak, uint64_t* elapsed_us) {
@@ -132,12 +243,18 @@ static void run_demo(Arena* arena, const GPTConfig* config) {
     printf("Static arena: %zu bytes at %p; token weights at %p\n",
            sizeof(arena_memory), (void*)arena_memory, (const void*)token_embedding);
     printf("Core 0 stack guard enabled; core 1 is idle. No KV cache.\n");
+#if GPT_MATMUL_UNROLL4
+    printf("Model matmul: four outputs at once.\n");
+#else
+    printf("Model matmul: baseline dot products.\n");
+#endif
     pico_memory_report("before inference");
     if (gpt_vocab_size != config->vocab_size || gpt_vocab[0] != '\n') {
         printf("ERROR: vocabulary does not match the model/start token.\n");
         return;
     }
-    if (!check_reference(arena, config) || !generate_sample(arena, config)) {
+    if (!benchmark_matmul(arena) || !check_reference(arena, config) ||
+        !generate_sample(arena, config)) {
         printf("ERROR: demo stopped; see diagnostics above.\n");
         pico_memory_report("failed demo");
         return;

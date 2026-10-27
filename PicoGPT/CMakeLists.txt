@@ -30,6 +30,8 @@ if(NOT PICO_PLATFORM STREQUAL "rp2350-arm-s")
     message(FATAL_ERROR "This bring-up target requires the RP2350 Arm cores.")
 endif()
 
+option(GPT_MATMUL_UNROLL4 "Use four-output matmul in model inference" OFF)
+
 add_executable(PicoGPT pico_main.c pico_memory.c gpt_vocab.c)
 target_include_directories(PicoGPT PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 target_link_libraries(PicoGPT pico_stdlib hardware_clocks m)
@@ -39,6 +41,7 @@ target_compile_options(PicoGPT PRIVATE
 target_compile_definitions(PicoGPT PRIVATE
     PICO_STACK_SIZE=0x1000
     PICO_USE_STACK_GUARDS=1
+    GPT_MATMUL_UNROLL4=$<BOOL:${GPT_MATMUL_UNROLL4}>
 )
 target_link_options(PicoGPT PRIVATE -Wl,--print-memory-usage)
 
