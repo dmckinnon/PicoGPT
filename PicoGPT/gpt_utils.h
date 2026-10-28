@@ -121,6 +121,11 @@ static inline void matmul_baseline(
     }
 }
 
+
+// Need to multithread this. Split the matrix in half
+// Still means we may be accessing the banks at the same time
+// Even with writing too
+// so, question: which is slower? Computation or memory IO?
 static inline void matmul_unroll4(
     const float* A, size_t rows_a, size_t cols_a,
     const float* B, size_t cols_b,
@@ -184,6 +189,8 @@ static inline void matmul_bias(
     if (bias) {
         for (size_t i = 0; i < rows_a; i++) {
             for (size_t j = 0; j < cols_b; j++) {
+
+                // unroll this
                 C[i * cols_b + j] += bias[j];
             }
         }
@@ -212,6 +219,7 @@ static inline void copy_tensor(
     float* dst,
     size_t length
 ) {
+    // why not use memcpy
     for (size_t i = 0; i < length; i++) {
         dst[i] = src[i];
     }
@@ -221,6 +229,7 @@ static inline void copy_tensor(
  * Zero out tensor data
  */
 static inline void zero_tensor(float* data, size_t length) {
+    // why not use memset
     for (size_t i = 0; i < length; i++) {
         data[i] = 0.0f;
     }
@@ -231,6 +240,8 @@ static inline void zero_tensor(float* data, size_t length) {
  */
 static inline void apply_gelu(float* data, size_t length) {
     for (size_t i = 0; i < length; i++) {
+
+        // what if we streamlined the gelu? Interleave all the parts of it
         data[i] = gelu_activation(data[i]);
     }
 }

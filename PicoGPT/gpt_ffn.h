@@ -33,6 +33,8 @@ static inline void ffn_forward(
     matmul(input, seq_len, embed_dim, up_weights, ffn_dim, hidden);
     
     // Apply GELU activation in-place
+
+    // given thsi is the only gelu spot, we can write this into the matmul
     apply_gelu(hidden, seq_len * ffn_dim);
     
     // Second linear layer: output = hidden * down_weights  
@@ -121,6 +123,9 @@ static inline float* ffn_with_residual(
     if (!ffn_output) {
         return NULL;
     }
+
+    // what's this extra arena allocation happening here?
+    // we can skip this by rolling the add into the ffn
     
     // Residual connection
     float* output = arena_alloc_tensor_2d(arena, seq_len, embed_dim);
