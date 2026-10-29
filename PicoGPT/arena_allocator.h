@@ -55,7 +55,8 @@ static inline void* arena_alloc(Arena* arena, size_t size) {
     arena->offset = aligned_offset + aligned_size;
     
     // Zero the allocated memory
-    memset(ptr, 0, size);
+    // How necessary is this???
+    // memset(ptr, 0, size);
     
     return ptr;
 }

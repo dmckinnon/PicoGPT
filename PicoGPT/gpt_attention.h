@@ -4,6 +4,11 @@
 #include "arena_allocator.h"
 #include "gpt_utils.h"
 #include "gpt_weights/gpt_constants.h"
+#include "gpt_profile.h"
+
+#ifndef GPT_ATTENTION_UNROLL4
+#define GPT_ATTENTION_UNROLL4 0
+#endif
 
 /**
  * QKV projection operation
@@ -34,13 +39,67 @@ static inline void qkv_projection(
     const float* v_weights = qkv_weights + 2 * embed_dim * embed_dim; // [2*embed_dim:3*embed_dim, :]
     
     // Project to Query
-    matmul(input, seq_len, embed_dim, q_weights, embed_dim, query);
+    matmul_unroll4(input, seq_len, embed_dim, q_weights, embed_dim, query);
     
     // Project to Key
-    matmul(input, seq_len, embed_dim, k_weights, embed_dim, key);
+    matmul_unroll4(input, seq_len, embed_dim, k_weights, embed_dim, key);
     
     // Project to Value
-    matmul(input, seq_len, embed_dim, v_weights, embed_dim, value);
+    matmul_unroll4(input, seq_len, embed_dim, v_weights, embed_dim, value);
+}
+
+/* One query against all key rows, sharing each query element across four scores. */
+static inline void attention_query_scores(
+    const float* query,
+    const float* key,
+    float* scores,
+    size_t seq_len,
+    size_t embed_dim
+) {
+    const float scale = INV_SQRT_HEAD_DIM;
+    size_t j = 0;
+#if GPT_ATTENTION_UNROLL4
+    for (; seq_len - j >= 4; j += 4) {
+        const float* key0 = key + j * embed_dim;
+        const float* key1 = key0 + embed_dim;
+        const float* key2 = key1 + embed_dim;
+        const float* key3 = key2 + embed_dim;
+        float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+        for (size_t k = 0; k < embed_dim; k++) {
+            float q = query[k];
+            sum0 += q * key0[k];
+            sum1 += q * key1[k];
+            sum2 += q * key2[k];
+            sum3 += q * key3[k];
+        }
+        scores[j] = sum0 * scale;
+        scores[j + 1] = sum1 * scale;
+        scores[j + 2] = sum2 * scale;
+        scores[j + 3] = sum3 * scale;
+    }
+#endif
+    for (; j < seq_len; j++) {
+        float sum = 0.0f;
+        for (size_t k = 0; k < embed_dim; k++) {
+            sum += query[k] * key[j * embed_dim + k];
+        }
+        scores[j] = sum * scale;
+    }
+}
+
+static inline void attention_weighted_values(
+    const float* scores,
+    const float* value,
+    float* output,
+    size_t query_count,
+    size_t seq_len,
+    size_t embed_dim
+) {
+#if GPT_ATTENTION_UNROLL4
+    matmul_unroll4(scores, query_count, seq_len, value, embed_dim, output);
+#else
+    matmul_baseline(scores, query_count, seq_len, value, embed_dim, output);
+#endif
 }
 
 /**
@@ -64,44 +123,44 @@ static inline void scaled_dot_product_attention(
     size_t seq_len,
     size_t embed_dim
 ) {
-    const float scale = INV_SQRT_HEAD_DIM; // 1/sqrt(embed_dim)
-    
     // Compute Q * K^T / root(embed_dim)
     // query: [seq_len, embed_dim], key^T: [embed_dim, seq_len] -> scores: [seq_len, seq_len]
+    GPT_PROFILE_BEGIN(GPT_STAGE_SCORES);
     for (size_t i = 0; i < seq_len; i++) {
-        for (size_t j = 0; j < seq_len; j++) {
-            float sum = 0.0f;
-            for (size_t k = 0; k < embed_dim; k++) {
-                sum += query[i * embed_dim + k] * key[j * embed_dim + k];
-            }
-            attention_scores[i * seq_len + j] = sum * scale;
-        }
+        attention_query_scores(query + i * embed_dim, key,
+                               attention_scores + i * seq_len, seq_len, embed_dim);
     }
+    GPT_PROFILE_END(GPT_STAGE_SCORES);
     
     // Apply causal mask and softmax for each query position
+    GPT_PROFILE_BEGIN(GPT_STAGE_MASK_SOFTMAX);
     for (size_t i = 0; i < seq_len; i++) {
         float* score_row = attention_scores + i * seq_len;
         
         // Apply causal mask (can only attend to previous and current positions)
-        for (size_t j = i + 1; j < seq_len; j++) {
+        size_t j = i + 1;
+#if GPT_ATTENTION_UNROLL4
+        for (; seq_len - j >= 4; j += 4) {
+            score_row[j] = -INFINITY;
+            score_row[j + 1] = -INFINITY;
+            score_row[j + 2] = -INFINITY;
+            score_row[j + 3] = -INFINITY;
+        }
+#endif
+        for (; j < seq_len; j++) {
             score_row[j] = -INFINITY;
         }
         
         // Apply softmax to this row
         softmax_inplace(score_row, seq_len);
     }
+    GPT_PROFILE_END(GPT_STAGE_MASK_SOFTMAX);
     
     // Apply attention weights to values: output = attention_scores * value
     // attention_scores: [seq_len, seq_len], value: [seq_len, embed_dim] -> output: [seq_len, embed_dim]
-    for (size_t i = 0; i < seq_len; i++) {
-        for (size_t j = 0; j < embed_dim; j++) {
-            float sum = 0.0f;
-            for (size_t k = 0; k < seq_len; k++) {
-                sum += attention_scores[i * seq_len + k] * value[k * embed_dim + j];
-            }
-            output[i * embed_dim + j] = sum;
-        }
-    }
+    GPT_PROFILE_BEGIN(GPT_STAGE_WEIGHTED_VALUES);
+    attention_weighted_values(attention_scores, value, output, seq_len, seq_len, embed_dim);
+    GPT_PROFILE_END(GPT_STAGE_WEIGHTED_VALUES);
 }
 
 /**
@@ -157,15 +216,19 @@ static inline float* multi_head_attention(
     }
     
     // Step 1: QKV Projection
+    GPT_PROFILE_BEGIN(GPT_STAGE_QKV);
     qkv_projection(input, qkv_weights, query, key, value, seq_len, embed_dim);
+    GPT_PROFILE_END(GPT_STAGE_QKV);
     
     // Step 2: Scaled Dot-Product Attention
     scaled_dot_product_attention(query, key, value, attention_output, 
                                 attention_scores, seq_len, embed_dim);
     
     // Step 3: Output Projection
+    GPT_PROFILE_BEGIN(GPT_STAGE_ATTN_PROJECTION);
     attention_output_projection(attention_output, output_weights, final_output, 
                                seq_len, embed_dim);
+    GPT_PROFILE_END(GPT_STAGE_ATTN_PROJECTION);
     
     return final_output;
 }
@@ -200,7 +263,9 @@ static inline float* attention_with_residual(
         return NULL;
     }
     
+    GPT_PROFILE_BEGIN(GPT_STAGE_PRE_NORM);
     layer_norm(input, normalized_input, ln_gamma, ln_beta, seq_len, embed_dim, LAYER_NORM_EPS);
+    GPT_PROFILE_END(GPT_STAGE_PRE_NORM);
     
     // Attention
     float* attention_output = multi_head_attention(arena, normalized_input, qkv_weights, 
@@ -216,7 +281,9 @@ static inline float* attention_with_residual(
     }
     
     size_t total_elements = seq_len * embed_dim;
+    GPT_PROFILE_BEGIN(GPT_STAGE_ATTN_RESIDUAL);
     add_tensors(input, attention_output, output, total_elements);
+    GPT_PROFILE_END(GPT_STAGE_ATTN_RESIDUAL);
     
     return output;
 }
@@ -294,28 +361,14 @@ static inline float* attention_last_token_only(
         return NULL;
     }
     
-    const float scale = INV_SQRT_HEAD_DIM;
-    
     // Compute attention scores for last query against all keys
-    for (size_t j = 0; j < seq_len; j++) {
-        float sum = 0.0f;
-        for (size_t k = 0; k < embed_dim; k++) {
-            sum += last_query[k] * key[j * embed_dim + k];
-        }
-        attention_scores[j] = sum * scale;
-    }
+    attention_query_scores(last_query, key, attention_scores, seq_len, embed_dim);
     
     // Apply softmax
     softmax_inplace(attention_scores, seq_len);
     
     // Apply attention to values
-    for (size_t j = 0; j < embed_dim; j++) {
-        float sum = 0.0f;
-        for (size_t k = 0; k < seq_len; k++) {
-            sum += attention_scores[k] * value[k * embed_dim + j];
-        }
-        output_vector[j] = sum;
-    }
+    attention_weighted_values(attention_scores, value, output_vector, 1, seq_len, embed_dim);
     
     // Output projection
     float* final_output = arena_alloc_tensor_1d(arena, embed_dim);

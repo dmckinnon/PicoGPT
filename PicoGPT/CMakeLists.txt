@@ -31,6 +31,9 @@ if(NOT PICO_PLATFORM STREQUAL "rp2350-arm-s")
 endif()
 
 option(GPT_MATMUL_UNROLL4 "Use four-output matmul in model inference" OFF)
+option(GPT_FFN_FUSE_GELU "Fuse GELU into the residual FFN up-projection" ON)
+option(GPT_ATTENTION_UNROLL4 "Unroll attention scores, mask and weighted values by four" OFF)
+option(GPT_PROFILE_ENABLED "Enable inference stage timing and SRAM bus diagnostics" OFF)
 
 add_executable(PicoGPT pico_main.c pico_memory.c gpt_vocab.c)
 target_include_directories(PicoGPT PRIVATE ${CMAKE_CURRENT_LIST_DIR})
@@ -42,6 +45,9 @@ target_compile_definitions(PicoGPT PRIVATE
     PICO_STACK_SIZE=0x1000
     PICO_USE_STACK_GUARDS=1
     GPT_MATMUL_UNROLL4=$<BOOL:${GPT_MATMUL_UNROLL4}>
+    GPT_FFN_FUSE_GELU=$<BOOL:${GPT_FFN_FUSE_GELU}>
+    GPT_ATTENTION_UNROLL4=$<BOOL:${GPT_ATTENTION_UNROLL4}>
+    GPT_PROFILE_ENABLED=$<BOOL:${GPT_PROFILE_ENABLED}>
 )
 target_link_options(PicoGPT PRIVATE -Wl,--print-memory-usage)
 

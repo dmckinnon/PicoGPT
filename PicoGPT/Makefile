@@ -11,6 +11,7 @@ SOURCE = main.c
 
 # Header dependencies
 HEADERS = arena_allocator.h \
+          gpt_profile.h \
           gpt_utils.h \
           gpt_embeddings_ops.h \
           gpt_layer_norm.h \

@@ -3,6 +3,11 @@
 
 #include "arena_allocator.h"
 #include "gpt_utils.h"
+#include "gpt_profile.h"
+
+#ifndef GPT_FFN_FUSE_GELU
+#define GPT_FFN_FUSE_GELU 1
+#endif
 
 /**
  * Feed-Forward Network (FFN) operation
@@ -40,6 +45,137 @@ static inline void ffn_forward(
     // Second linear layer: output = hidden * down_weights  
     // hidden: [seq_len, ffn_dim], down_weights: [ffn_dim, embed_dim] -> output: [seq_len, embed_dim]
     matmul(hidden, seq_len, ffn_dim, down_weights, embed_dim, output);
+}
+
+/**
+ * Feed-Forward Network (FFN) operation
+ * WITH RESIDUAL
+ * Implements: FFN(x) = GELU(x * W1) * W2
+ * This is a two-layer MLP with GELU activation
+ *
+ * @param input: Input tensor [seq_len, embed_dim]
+ * @param up_weights: First layer weights [embed_dim, ffn_dim]
+ * @param down_weights: Second layer weights [ffn_dim, embed_dim]
+ * @param output: Output tensor [seq_len, embed_dim]
+ * @param hidden: Temporary tensor for intermediate results [seq_len, ffn_dim]
+ * @param seq_len: Sequence length
+ * @param embed_dim: Input/output embedding dimension
+ * @param ffn_dim: Hidden FFN dimension
+ */
+static inline void ffn_forward_add_residual(
+    float* input,
+    const float* residual_input,
+    const float* up_weights,
+    const float* down_weights,
+    float* output,
+    float* hidden,
+    size_t seq_len,
+    size_t embed_dim,
+    size_t ffn_dim,
+    size_t total_elements
+) {
+    (void)total_elements;
+    // First linear layer: hidden = input * up_weights
+    // input: [seq_len, embed_dim], up_weights: [embed_dim, ffn_dim] -> hidden: [seq_len, ffn_dim]
+    // matmul(input, seq_len, embed_dim, up_weights, ffn_dim, hidden);
+
+    // combine matmul with GeLU to streamline
+    size_t rows_a = seq_len;
+    size_t cols_a = embed_dim;
+    size_t cols_b = ffn_dim;
+    float* A = input;
+    const float* B = up_weights;
+    float* C = hidden;
+    GPT_PROFILE_BEGIN(GPT_STAGE_FFN_UP);
+#if GPT_FFN_FUSE_GELU
+    for (size_t i = 0; i < rows_a; i++) {
+        const float* row = A + i * cols_a;
+        float* output = C + i * cols_b;
+        size_t j = 0;
+        for (; cols_b - j >= 4; j += 4) {
+            float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+            for (size_t k = 0; k < cols_a; k++) {
+                float a = row[k];
+                const float* weights = B + k * cols_b + j;
+                sum0 += a * weights[0];
+                sum1 += a * weights[1];
+                sum2 += a * weights[2];
+                sum3 += a * weights[3];
+            }
+            // erff actually requires a lot of registers, and therefore we have to write out
+            // values to stack which slows this down v. just having GELU as a separate function
+            // not unrolled
+            output[j] = 0.5f * sum0 * (1.0f + erff(sum0 * 0.7071067811865475f));
+            output[j + 1] = 0.5f * sum1 * (1.0f + erff(sum1 * 0.7071067811865475f));
+            output[j + 2] = 0.5f * sum2 * (1.0f + erff(sum2 * 0.7071067811865475f));
+            output[j + 3] = 0.5f * sum3 * (1.0f + erff(sum3 * 0.7071067811865475f));
+        }
+        for (; j < cols_b; j++) {
+            float sum = 0.0f;
+            for (size_t k = 0; k < cols_a; k++) {
+                sum += row[k] * B[k * cols_b + j];
+            }
+            output[j] = 0.5f * sum * (1.0f + erff(sum * 0.7071067811865475f));
+        }
+    }
+    GPT_PROFILE_END(GPT_STAGE_FFN_UP);
+#else
+    // Keep the same four-output projection; only move GELU into its own pass.
+    matmul_unroll4(input, seq_len, embed_dim, up_weights, ffn_dim, hidden);
+    GPT_PROFILE_END(GPT_STAGE_FFN_UP);
+    GPT_PROFILE_BEGIN(GPT_STAGE_GELU);
+    apply_gelu(hidden, seq_len * ffn_dim);
+    GPT_PROFILE_END(GPT_STAGE_GELU);
+#endif
+
+    // Second linear layer: output = hidden * down_weights
+    // hidden: [seq_len, ffn_dim], down_weights: [ffn_dim, embed_dim] -> output: [seq_len, embed_dim]
+    // the tensor "input" has had its values used in the first matmul, so it's safe to overwrite now
+    // knowing that "input" and "output" tensors are actually the same tensor
+    // matmul(hidden, seq_len, ffn_dim, down_weights, embed_dim, output);
+
+    // Combine matmul with the residual add to streamline
+    rows_a = seq_len;
+    cols_a = ffn_dim;
+    cols_b = embed_dim;
+    A = hidden;
+    B = down_weights;
+    C = output;
+    GPT_PROFILE_BEGIN(GPT_STAGE_FFN_DOWN_RESIDUAL);
+    for (size_t i = 0; i < rows_a; i++) {
+        const float* row = A + i * cols_a;
+        float* output_row = C + i * cols_b;
+        size_t j = 0;
+        size_t element_number = i * cols_b;
+        for (; cols_b - j >= 4; j += 4) {
+            float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+            for (size_t k = 0; k < cols_a; k++) {
+                float a = row[k];
+                const float* weights = B + k * cols_b + j;
+                sum0 += a * weights[0];
+                sum1 += a * weights[1];
+                sum2 += a * weights[2];
+                sum3 += a * weights[3];
+            }
+            output_row[j] = sum0 + residual_input[element_number + j];
+            output_row[j + 1] = sum1 + residual_input[element_number + j + 1];
+            output_row[j + 2] = sum2 + residual_input[element_number + j + 2];
+            output_row[j + 3] = sum3 + residual_input[element_number + j + 3];
+        }
+        for (; j < cols_b; j++) {
+            float sum = 0.0f;
+            for (size_t k = 0; k < cols_a; k++) {
+                sum += row[k] * B[k * cols_b + j];
+            }
+            output_row[j] = sum + residual_input[element_number + j];
+        }
+    }
+    GPT_PROFILE_END(GPT_STAGE_FFN_DOWN_RESIDUAL);
+    // Add in residual, to save allocating extra tensor?
+    // Does this really speed things up?
+    // for (size_t i = 0; i < total_elements; i++) {
+    //     output[i] += residual_input[i];
+    // }
 }
 
 /**
@@ -83,6 +219,7 @@ static inline float* ffn_op(
     return output;
 }
 
+
 /**
  * FFN with residual connection and layer norm
  * output = input + FFN(LayerNorm(input))
@@ -100,7 +237,7 @@ static inline float* ffn_op(
  */
 static inline float* ffn_with_residual(
     Arena* arena,
-    const float* input,
+    float* input,
     const float* up_weights,
     const float* down_weights,
     const float* ln_gamma,
@@ -110,31 +247,29 @@ static inline float* ffn_with_residual(
     size_t ffn_dim
 ) {
     // Pre-layer norm
-    float* normalized_input = arena_alloc_tensor_2d(arena, seq_len, embed_dim);
-    if (!normalized_input) {
-        return NULL;
-    }
-    
-    layer_norm(input, normalized_input, ln_gamma, ln_beta, seq_len, embed_dim, LAYER_NORM_EPS);
-    
-    // FFN
-    float* ffn_output = ffn_op(arena, normalized_input, up_weights, down_weights, 
-                              seq_len, embed_dim, ffn_dim);
-    if (!ffn_output) {
-        return NULL;
-    }
-
-    // what's this extra arena allocation happening here?
-    // we can skip this by rolling the add into the ffn
-    
-    // Residual connection
     float* output = arena_alloc_tensor_2d(arena, seq_len, embed_dim);
     if (!output) {
         return NULL;
     }
     
+    GPT_PROFILE_BEGIN(GPT_STAGE_PRE_NORM);
+    layer_norm(input, output, ln_gamma, ln_beta, seq_len, embed_dim, LAYER_NORM_EPS);
+    GPT_PROFILE_END(GPT_STAGE_PRE_NORM);
+    
+    // Allocate hidden layer tensor
+    float* hidden = arena_alloc_tensor_2d(arena, seq_len, ffn_dim);
+    if (!hidden) {
+        return NULL; // Out of memory
+    }
+    
+    // Perform FFN computation
+    // "output" here is the normalised input, and therefore input to the ffn
+
     size_t total_elements = seq_len * embed_dim;
-    add_tensors(input, ffn_output, output, total_elements);
+    ffn_forward_add_residual(output, input, up_weights, down_weights, output, hidden,
+                seq_len, embed_dim, ffn_dim, total_elements);
+
+
     
     return output;
 }
@@ -176,6 +311,8 @@ static inline float* ffn_single_token(
     
     // GELU activation
     apply_gelu(hidden, ffn_dim);
+
+    // Apply within matmul
     
     // Second linear layer
     matmul(hidden, 1, ffn_dim, down_weights, embed_dim, output);

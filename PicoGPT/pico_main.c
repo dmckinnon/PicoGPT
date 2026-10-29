@@ -11,6 +11,11 @@
 #include "gpt_vocab.h"
 #include "pico_memory.h"
 
+#if GPT_PROFILE_ENABLED
+#include "hardware/structs/busctrl.h"
+#include "hardware/sync.h"
+#endif
+
 #define ARENA_SIZE (144 * 1024)
 #define NEW_TOKENS 100
 #define MATMUL_REPEATS 10
@@ -18,6 +23,25 @@
 
 static _Alignas(8) uint8_t arena_memory[ARENA_SIZE];
 static volatile float matmul_benchmark_sink;
+
+#if GPT_PROFILE_ENABLED
+static bool profile_capture;
+static struct {
+    uint64_t time_us;
+    uint32_t calls;
+} profile_stages[GPT_STAGE_COUNT];
+
+uint64_t gpt_profile_now(void) {
+    return profile_capture ? time_us_64() : 0;
+}
+
+void gpt_profile_record(GPTProfileStage stage, uint64_t elapsed_us) {
+    if (profile_capture) {
+        profile_stages[stage].time_us += elapsed_us;
+        profile_stages[stage].calls++;
+    }
+}
+#endif
 
 /* TFLite logits for IDs 0..30, with its final GATHER index corrected to 30. */
 static const float reference_logits[VOCAB_SIZE] = {
@@ -199,6 +223,142 @@ static bool check_reference(Arena* arena, const GPTConfig* config) {
     return passed;
 }
 
+#if GPT_PROFILE_ENABLED
+static bool profile_stages_at_length(Arena* arena, const GPTConfig* config, size_t length) {
+    static const char* const names[GPT_STAGE_COUNT] = {
+        "Embeddings (+allocation)",
+        "Pre-layer normalization",
+        "Q/K/V projections",
+        "Attention QK scores",
+        "Causal mask + softmax",
+        "Attention probabilities * V",
+        "Attention output projection",
+        "Attention residual addition",
+#if GPT_FFN_FUSE_GELU
+        "FFN up + fused GELU",
+#else
+        "FFN up projection",
+#endif
+        "Separate GELU",
+        "FFN down + residual",
+        "Final normalization (+allocation)",
+        "All-position logits (+allocation)",
+    };
+    const size_t runs = 5;
+    int32_t tokens[MAX_SEQ_LEN];
+    for (size_t i = 0; i < MAX_SEQ_LEN; i++) tokens[i] = (int32_t)i;
+    size_t peak = 0;
+    uint64_t total = 0;
+    if (!infer(arena, config, tokens, length, &peak, &total)) return false;
+    total = 0;
+    memset(profile_stages, 0, sizeof(profile_stages));
+    profile_capture = true;
+    for (size_t run = 0; run < runs; run++) {
+        if (!infer(arena, config, tokens, length, &peak, &total)) {
+            profile_capture = false;
+            return false;
+        }
+    }
+    profile_capture = false;
+    if (!total) {
+        printf("ERROR: inference profiling interval is below timer resolution.\n");
+        return false;
+    }
+    uint64_t accounted = 0;
+    printf("\nStage profile: context=%zu, %zu runs, both blocks combined, interrupts enabled.\n",
+           length, runs);
+    printf("  Instrumented inference average: %.3f us; arena peak %zu bytes.\n",
+           (double)total / runs, peak);
+    printf("  Stage                              us/inference   %% total   calls over all runs\n");
+    for (size_t stage = 0; stage < GPT_STAGE_COUNT; stage++) {
+        accounted += profile_stages[stage].time_us;
+        printf("  %-34s %10.3f    %6.2f    %" PRIu32 "\n", names[stage],
+               (double)profile_stages[stage].time_us / runs,
+               100.0 * (double)profile_stages[stage].time_us / (double)total,
+               profile_stages[stage].calls);
+    }
+    if (accounted > total) {
+        printf("ERROR: stage accounting exceeds measured inference time.\n");
+        return false;
+    }
+    printf("  Other/allocator/instrumentation    %10.3f    %6.2f\n",
+           (double)(total - accounted) / runs, 100.0 * (double)(total - accounted) / (double)total);
+    return true;
+}
+
+static bool profile_sram_bus(Arena* arena, const GPTConfig* config) {
+    if (busctrl_hw->perfctr_en) {
+        printf("ERROR: bus counters already enabled; leaving their owner undisturbed.\n");
+        return false;
+    }
+    uint32_t saved_selectors[4];
+    for (size_t i = 0; i < 4; i++) saved_selectors[i] = busctrl_hw->counter[i].sel;
+    int32_t tokens[MAX_SEQ_LEN];
+    for (size_t i = 0; i < MAX_SEQ_LEN; i++) tokens[i] = (int32_t)i;
+    struct {
+        uint32_t counts[4];
+        uint64_t elapsed;
+    } measurements[10] = {0};
+    bool passed = true;
+    size_t peak = 0;
+    profile_capture = false;
+    for (size_t bank = 0; bank < 10; bank++) {
+        /* SDK events are contiguous: upstream, downstream, contested, access. */
+        uint32_t first_event = arbiter_sram0_perf_event_stall_upstream - 4 * bank;
+        for (size_t event = 0; event < 4; event++) {
+            busctrl_hw->counter[event].sel = first_event + event;
+            busctrl_hw->counter[event].value = 0;
+        }
+        __dsb();
+        busctrl_hw->perfctr_en = 1;
+        __dsb();
+        float* logits = infer(arena, config, tokens, MAX_SEQ_LEN, &peak,
+                              &measurements[bank].elapsed);
+        __dsb();
+        busctrl_hw->perfctr_en = 0;
+        __dsb();
+        for (size_t event = 0; event < 4; event++) {
+            measurements[bank].counts[event] = busctrl_hw->counter[event].value;
+            if (measurements[bank].counts[event] == BUSCTRL_PERFCTR0_BITS) {
+                printf("ERROR: SRAM%zu event %zu counter saturated; discard this report.\n",
+                       bank, event);
+                passed = false;
+            }
+        }
+        if (!logits || !passed) {
+            passed = false;
+            break;
+        }
+    }
+    for (size_t i = 0; i < 4; i++) busctrl_hw->counter[i].sel = saved_selectors[i];
+    if (!passed) return false;
+    printf("\nSRAM bus events: one full-context pass per bank; includes wrapper/validation and interrupts.\n");
+    printf("  Bank   accesses   contested accesses   upstream stall cycles   downstream stall cycles   inference us\n");
+    for (size_t bank = 0; bank < 10; bank++) {
+        const uint32_t* counts = measurements[bank].counts;
+        printf("  %4zu %10" PRIu32 " %20" PRIu32 " %23" PRIu32 " %25" PRIu32 " %14" PRIu64 "\n",
+               bank, counts[3], counts[2], counts[0], counts[1], measurements[bank].elapsed);
+    }
+    printf("  Counters include instruction fetches and all bus masters, not just tensor data.\n");
+    printf("  Banks are sampled on separate runs. Do not sum stall counts into a CPU stalled-time percentage.\n");
+    printf("  Low stalls do not eliminate load/store instruction costs; high accesses alone do not prove a bottleneck.\n");
+    return true;
+}
+
+static void run_profile(Arena* arena, const GPTConfig* config) {
+    printf("\nProfiling changes code layout/register allocation; compare stage shares, not absolute speed against other UF2s.\n");
+    if (!check_reference(arena, config) ||
+        !profile_stages_at_length(arena, config, 1) ||
+        !profile_stages_at_length(arena, config, MAX_SEQ_LEN) ||
+        !profile_sram_bus(arena, config)) {
+        printf("ERROR: profiling stopped; see diagnostics above.\n");
+        return;
+    }
+    pico_memory_report("after profiling");
+    printf("Profile complete. Send 'p' to repeat.\n");
+}
+#endif
+
 static bool generate_sample(Arena* arena, const GPTConfig* config) {
     int32_t tokens[NEW_TOKENS + 1] = {0};
     size_t peak = 0;
@@ -243,10 +403,23 @@ static void run_demo(Arena* arena, const GPTConfig* config) {
     printf("Static arena: %zu bytes at %p; token weights at %p\n",
            sizeof(arena_memory), (void*)arena_memory, (const void*)token_embedding);
     printf("Core 0 stack guard enabled; core 1 is idle. No KV cache.\n");
+#if GPT_PROFILE_ENABLED
+    printf("Profiling build: send 'p' for stage timing and SRAM bus counters; ordinary timings are instrumented.\n");
+#endif
 #if GPT_MATMUL_UNROLL4
     printf("Model matmul: four outputs at once.\n");
 #else
     printf("Model matmul: baseline dot products.\n");
+#endif
+#if GPT_FFN_FUSE_GELU
+    printf("FFN: buffer reuse, fused residual, fused GELU.\n");
+#else
+    printf("FFN: buffer reuse, fused residual, separate GELU.\n");
+#endif
+#if GPT_ATTENTION_UNROLL4
+    printf("Attention: four scores, four values, four mask writes at once.\n");
+#else
+    printf("Attention: scalar scores, values and mask writes.\n");
 #endif
     pico_memory_report("before inference");
     if (gpt_vocab_size != config->vocab_size || gpt_vocab[0] != '\n') {
@@ -286,5 +459,10 @@ int main(void) {
         if (command == 'r') {
             run_demo(&arena, &config);
         }
+#if GPT_PROFILE_ENABLED
+        if (command == 'p') {
+            run_profile(&arena, &config);
+        }
+#endif
     }
 }

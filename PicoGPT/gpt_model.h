@@ -8,6 +8,7 @@
 #include "gpt_attention.h"
 #include "gpt_ffn.h"
 #include "gpt_utils.h"
+#include "gpt_profile.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -127,7 +128,9 @@ static inline float* gpt_forward(
     }
     
     // 1. Embedding lookup (token + position)
+    GPT_PROFILE_BEGIN(GPT_STAGE_EMBEDDINGS);
     float* embeddings = embedding_op(arena, token_ids, seq_len);
+    GPT_PROFILE_END(GPT_STAGE_EMBEDDINGS);
     if (!embeddings) {
         printf("Error: Failed to allocate embeddings\n");
         return NULL;
@@ -145,10 +148,12 @@ static inline float* gpt_forward(
     }
     
     // 3. Final layer normalization
+    GPT_PROFILE_BEGIN(GPT_STAGE_FINAL_NORM);
     float* final_output = layer_norm_alloc(
         arena, current_output, final_ln_gamma, final_ln_beta,
         seq_len, config->embed_dim
     );
+    GPT_PROFILE_END(GPT_STAGE_FINAL_NORM);
     
     // this output is in embedding space
     return final_output;
@@ -218,22 +223,24 @@ static inline float* gpt_inference(
     }
     
     // Generate logits
+    GPT_PROFILE_BEGIN(GPT_STAGE_LOGITS);
     float* all_logits = generate_logits(arena, hidden_states, seq_len, config);
+    GPT_PROFILE_END(GPT_STAGE_LOGITS);
     if (!all_logits) {
         return NULL;
     }
     
     // Return logits for the last position (next token prediction)
-    float* next_token_logits = arena_alloc_tensor_1d(arena, config->vocab_size);
-    if (!next_token_logits) {
-        return NULL;
-    }
+    // float* next_token_logits = arena_alloc_tensor_1d(arena, config->vocab_size);
+    // if (!next_token_logits) {
+    //     return NULL;
+    // }
 
     // Copy logits for last position
-    const float* last_logits = all_logits + (seq_len - 1) * config->vocab_size;
-    copy_tensor(last_logits, next_token_logits, config->vocab_size);
+    // const float* last_logits = all_logits + (seq_len - 1) * config->vocab_size;
+    // copy_tensor(last_logits, next_token_logits, config->vocab_size);
     
-    return next_token_logits;
+    return all_logits + (seq_len - 1) * config->vocab_size;
 }
 
 /**
