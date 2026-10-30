@@ -105,22 +105,25 @@ static inline float* transformer_layer(
 }
 
 /**
- * Complete GPT forward pass
- * Processes input tokens through the entire model
+ * Embeddings and transformer blocks, before final layer normalization
  * 
  * @param arena: Memory arena for allocations
  * @param token_ids: Input token sequence [seq_len]
  * @param seq_len: Sequence length
  * @param config: Model configuration
- * @return: Pointer to final layer output [seq_len, embed_dim]
+ * @return: Pointer to unnormalized hidden states [seq_len, embed_dim]
  */
-static inline float* gpt_forward(
+static inline float* gpt_transformer_forward(
     Arena* arena,
     const int32_t* token_ids,
     size_t seq_len,
     const GPTConfig* config
 ) {
     // Bounds check
+    if (seq_len == 0) {
+        printf("Error: Input sequence must contain at least one token\n");
+        return NULL;
+    }
     if (seq_len > config->max_seq_len) {
         printf("Error: Sequence length %zu exceeds maximum %zu\n", 
                seq_len, config->max_seq_len);
@@ -146,11 +149,28 @@ static inline float* gpt_forward(
             return NULL;
         }
     }
-    
-    // 3. Final layer normalization
+
+    return current_output;
+}
+
+/**
+ * Complete forward pass, preserving normalized outputs for every input position.
+ * Returns [seq_len, embed_dim] in the arena.
+ */
+static inline float* gpt_forward(
+    Arena* arena,
+    const int32_t* token_ids,
+    size_t seq_len,
+    const GPTConfig* config
+) {
+    float* hidden_states = gpt_transformer_forward(arena, token_ids, seq_len, config);
+    if (!hidden_states) {
+        return NULL;
+    }
+
     GPT_PROFILE_BEGIN(GPT_STAGE_FINAL_NORM);
     float* final_output = layer_norm_alloc(
-        arena, current_output, final_ln_gamma, final_ln_beta,
+        arena, hidden_states, final_ln_gamma, final_ln_beta,
         seq_len, config->embed_dim
     );
     GPT_PROFILE_END(GPT_STAGE_FINAL_NORM);
@@ -208,7 +228,7 @@ static inline float* generate_logits(
  * @param token_ids: Input token sequence [seq_len]
  * @param seq_len: Sequence length
  * @param config: Model configuration
- * @return: Pointer to logits for next token [vocab_size]
+ * @return: Arena-owned logits [vocab_size], valid until arena reset/restore
  */
 static inline float* gpt_inference(
     Arena* arena,
@@ -216,31 +236,31 @@ static inline float* gpt_inference(
     size_t seq_len,
     const GPTConfig* config
 ) {
-    // Forward pass
-    float* hidden_states = gpt_forward(arena, token_ids, seq_len, config);
+    float* hidden_states = gpt_transformer_forward(arena, token_ids, seq_len, config);
     if (!hidden_states) {
         return NULL;
     }
     
-    // Generate logits
-    GPT_PROFILE_BEGIN(GPT_STAGE_LOGITS);
-    float* all_logits = generate_logits(arena, hidden_states, seq_len, config);
-    GPT_PROFILE_END(GPT_STAGE_LOGITS);
-    if (!all_logits) {
+    /* Final normalization and the vocabulary head are independent for each row. */
+    const float* last_hidden = hidden_states + (seq_len - 1) * config->embed_dim;
+    GPT_PROFILE_BEGIN(GPT_STAGE_FINAL_NORM);
+    float* normalized = layer_norm_alloc(
+        arena, last_hidden, final_ln_gamma, final_ln_beta, 1, config->embed_dim
+    );
+    GPT_PROFILE_END(GPT_STAGE_FINAL_NORM);
+    if (!normalized) {
+        printf("Error: Failed to allocate final token normalization\n");
         return NULL;
     }
-    
-    // Return logits for the last position (next token prediction)
-    // float* next_token_logits = arena_alloc_tensor_1d(arena, config->vocab_size);
-    // if (!next_token_logits) {
-    //     return NULL;
-    // }
 
-    // Copy logits for last position
-    // const float* last_logits = all_logits + (seq_len - 1) * config->vocab_size;
-    // copy_tensor(last_logits, next_token_logits, config->vocab_size);
-    
-    return all_logits + (seq_len - 1) * config->vocab_size;
+    GPT_PROFILE_BEGIN(GPT_STAGE_LOGITS);
+    float* logits = generate_logits(arena, normalized, 1, config);
+    GPT_PROFILE_END(GPT_STAGE_LOGITS);
+    if (!logits) {
+        printf("Error: Failed to allocate next-token logits\n");
+        return NULL;
+    }
+    return logits;
 }
 
 /**

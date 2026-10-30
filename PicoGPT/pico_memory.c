@@ -7,6 +7,7 @@
 #include "pico/stdlib.h"
 
 #include "pico_memory.h"
+#include "gpt_multicore.h"
 
 #define STACK_MARKER UINT32_C(0xa5c39e71)
 
@@ -14,6 +15,10 @@ extern char __StackBottom;
 extern char __StackTop;
 extern char __end__;
 extern char __HeapLimit;
+#if GPT_MULTICORE
+extern char __StackOneBottom;
+extern char __StackOneTop;
+#endif
 extern void* _sbrk(int increment);
 
 static size_t sampled_heap_peak;
@@ -87,5 +92,9 @@ void pico_memory_report(const char* label) {
     printf("  Core 0 stack observed watermark: %zu/%zu bytes; untouched margin: %zu bytes.\n",
            stack_used, stack_capacity, stack_capacity - stack_used);
     printf("  Stack observation starts in main; excludes earlier startup and is not a worst-case bound.\n");
+#if GPT_MULTICORE
+    printf("  Core 1 stack reservation: %" PRIuPTR " bytes in scratch X; guard enabled, peak not measured.\n",
+           (uintptr_t)&__StackOneTop - (uintptr_t)&__StackOneBottom);
+#endif
     printf("  Arena/stack reservations are already counted; do not add their observed usage again.\n");
 }

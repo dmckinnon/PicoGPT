@@ -39,13 +39,13 @@ static inline void qkv_projection(
     const float* v_weights = qkv_weights + 2 * embed_dim * embed_dim; // [2*embed_dim:3*embed_dim, :]
     
     // Project to Query
-    matmul_unroll4(input, seq_len, embed_dim, q_weights, embed_dim, query);
+    matmul(input, seq_len, embed_dim, q_weights, embed_dim, query);
     
     // Project to Key
-    matmul_unroll4(input, seq_len, embed_dim, k_weights, embed_dim, key);
+    matmul(input, seq_len, embed_dim, k_weights, embed_dim, key);
     
     // Project to Value
-    matmul_unroll4(input, seq_len, embed_dim, v_weights, embed_dim, value);
+    matmul(input, seq_len, embed_dim, v_weights, embed_dim, value);
 }
 
 /* One query against all key rows, sharing each query element across four scores. */
@@ -95,7 +95,9 @@ static inline void attention_weighted_values(
     size_t seq_len,
     size_t embed_dim
 ) {
-#if GPT_ATTENTION_UNROLL4
+#if GPT_MULTICORE
+    matmul(scores, query_count, seq_len, value, embed_dim, output);
+#elif GPT_ATTENTION_UNROLL4
     matmul_unroll4(scores, query_count, seq_len, value, embed_dim, output);
 #else
     matmul_baseline(scores, query_count, seq_len, value, embed_dim, output);

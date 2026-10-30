@@ -9,6 +9,10 @@
 #define GPT_FFN_FUSE_GELU 1
 #endif
 
+#if GPT_MULTICORE && GPT_FFN_FUSE_GELU
+#error "Multicore FFN requires GPT_FFN_FUSE_GELU=0 so GELU can be dispatched separately"
+#endif
+
 /**
  * Feed-Forward Network (FFN) operation
  * Implements: FFN(x) = GELU(x * W1) * W2
@@ -47,6 +51,8 @@ static inline void ffn_forward(
     matmul(hidden, seq_len, ffn_dim, down_weights, embed_dim, output);
 }
 
+
+
 /**
  * Feed-Forward Network (FFN) operation
  * WITH RESIDUAL
@@ -75,107 +81,48 @@ static inline void ffn_forward_add_residual(
     size_t total_elements
 ) {
     (void)total_elements;
-    // First linear layer: hidden = input * up_weights
-    // input: [seq_len, embed_dim], up_weights: [embed_dim, ffn_dim] -> hidden: [seq_len, ffn_dim]
-    // matmul(input, seq_len, embed_dim, up_weights, ffn_dim, hidden);
-
-    // combine matmul with GeLU to streamline
-    size_t rows_a = seq_len;
-    size_t cols_a = embed_dim;
-    size_t cols_b = ffn_dim;
-    float* A = input;
-    const float* B = up_weights;
-    float* C = hidden;
     GPT_PROFILE_BEGIN(GPT_STAGE_FFN_UP);
 #if GPT_FFN_FUSE_GELU
-    for (size_t i = 0; i < rows_a; i++) {
-        const float* row = A + i * cols_a;
-        float* output = C + i * cols_b;
+    for (size_t i = 0; i < seq_len; i++) {
+        const float* row = input + i * embed_dim;
+        float* hidden_row = hidden + i * ffn_dim;
         size_t j = 0;
-        for (; cols_b - j >= 4; j += 4) {
+        for (; ffn_dim - j >= 4; j += 4) {
             float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
-            for (size_t k = 0; k < cols_a; k++) {
+            for (size_t k = 0; k < embed_dim; k++) {
                 float a = row[k];
-                const float* weights = B + k * cols_b + j;
+                const float* weights = up_weights + k * ffn_dim + j;
                 sum0 += a * weights[0];
                 sum1 += a * weights[1];
                 sum2 += a * weights[2];
                 sum3 += a * weights[3];
             }
-            // erff actually requires a lot of registers, and therefore we have to write out
-            // values to stack which slows this down v. just having GELU as a separate function
-            // not unrolled
-            output[j] = 0.5f * sum0 * (1.0f + erff(sum0 * 0.7071067811865475f));
-            output[j + 1] = 0.5f * sum1 * (1.0f + erff(sum1 * 0.7071067811865475f));
-            output[j + 2] = 0.5f * sum2 * (1.0f + erff(sum2 * 0.7071067811865475f));
-            output[j + 3] = 0.5f * sum3 * (1.0f + erff(sum3 * 0.7071067811865475f));
+            hidden_row[j] = gelu_activation(sum0);
+            hidden_row[j + 1] = gelu_activation(sum1);
+            hidden_row[j + 2] = gelu_activation(sum2);
+            hidden_row[j + 3] = gelu_activation(sum3);
         }
-        for (; j < cols_b; j++) {
+        for (; j < ffn_dim; j++) {
             float sum = 0.0f;
-            for (size_t k = 0; k < cols_a; k++) {
-                sum += row[k] * B[k * cols_b + j];
+            for (size_t k = 0; k < embed_dim; k++) {
+                sum += row[k] * up_weights[k * ffn_dim + j];
             }
-            output[j] = 0.5f * sum * (1.0f + erff(sum * 0.7071067811865475f));
+            hidden_row[j] = gelu_activation(sum);
         }
     }
     GPT_PROFILE_END(GPT_STAGE_FFN_UP);
 #else
-    // Keep the same four-output projection; only move GELU into its own pass.
-    matmul_unroll4(input, seq_len, embed_dim, up_weights, ffn_dim, hidden);
+    matmul(input, seq_len, embed_dim, up_weights, ffn_dim, hidden);
     GPT_PROFILE_END(GPT_STAGE_FFN_UP);
     GPT_PROFILE_BEGIN(GPT_STAGE_GELU);
     apply_gelu(hidden, seq_len * ffn_dim);
     GPT_PROFILE_END(GPT_STAGE_GELU);
 #endif
 
-    // Second linear layer: output = hidden * down_weights
-    // hidden: [seq_len, ffn_dim], down_weights: [ffn_dim, embed_dim] -> output: [seq_len, embed_dim]
-    // the tensor "input" has had its values used in the first matmul, so it's safe to overwrite now
-    // knowing that "input" and "output" tensors are actually the same tensor
-    // matmul(hidden, seq_len, ffn_dim, down_weights, embed_dim, output);
-
-    // Combine matmul with the residual add to streamline
-    rows_a = seq_len;
-    cols_a = ffn_dim;
-    cols_b = embed_dim;
-    A = hidden;
-    B = down_weights;
-    C = output;
+    /* The up-projection has completed on both cores before input is reused. */
     GPT_PROFILE_BEGIN(GPT_STAGE_FFN_DOWN_RESIDUAL);
-    for (size_t i = 0; i < rows_a; i++) {
-        const float* row = A + i * cols_a;
-        float* output_row = C + i * cols_b;
-        size_t j = 0;
-        size_t element_number = i * cols_b;
-        for (; cols_b - j >= 4; j += 4) {
-            float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
-            for (size_t k = 0; k < cols_a; k++) {
-                float a = row[k];
-                const float* weights = B + k * cols_b + j;
-                sum0 += a * weights[0];
-                sum1 += a * weights[1];
-                sum2 += a * weights[2];
-                sum3 += a * weights[3];
-            }
-            output_row[j] = sum0 + residual_input[element_number + j];
-            output_row[j + 1] = sum1 + residual_input[element_number + j + 1];
-            output_row[j + 2] = sum2 + residual_input[element_number + j + 2];
-            output_row[j + 3] = sum3 + residual_input[element_number + j + 3];
-        }
-        for (; j < cols_b; j++) {
-            float sum = 0.0f;
-            for (size_t k = 0; k < cols_a; k++) {
-                sum += row[k] * B[k * cols_b + j];
-            }
-            output_row[j] = sum + residual_input[element_number + j];
-        }
-    }
+    matmul_with_residual(hidden, seq_len, ffn_dim, down_weights, embed_dim, residual_input, output);
     GPT_PROFILE_END(GPT_STAGE_FFN_DOWN_RESIDUAL);
-    // Add in residual, to save allocating extra tensor?
-    // Does this really speed things up?
-    // for (size_t i = 0; i < total_elements; i++) {
-    //     output[i] += residual_input[i];
-    // }
 }
 
 /**

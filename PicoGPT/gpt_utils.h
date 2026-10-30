@@ -1,6 +1,7 @@
 #ifndef GPT_UTILS_H
 #define GPT_UTILS_H
 
+#include "gpt_multicore.h"
 #include <math.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -160,8 +161,46 @@ static inline void matmul_unroll4(
     }
 }
 
+/* C must not overlap A or B; exact C == residual is supported. */
+static inline void matmul_with_residual_single_core(
+    const float* A, size_t rows_a, size_t cols_a,
+    const float* B, size_t cols_b,
+    const float* residual,
+    float* C
+)
+{
+    for (size_t i = 0; i < rows_a; i++) {
+        const float* row = A + i * cols_a;
+        float* output_row = C + i * cols_b;
+        size_t j = 0;
+        size_t element_number = i * cols_b;
+        for (; cols_b - j >= 4; j += 4) {
+            float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+            for (size_t k = 0; k < cols_a; k++) {
+                float a = row[k];
+                const float* weights = B + k * cols_b + j;
+                sum0 += a * weights[0];
+                sum1 += a * weights[1];
+                sum2 += a * weights[2];
+                sum3 += a * weights[3];
+            }
+            output_row[j] = sum0 + residual[element_number + j];
+            output_row[j + 1] = sum1 + residual[element_number + j + 1];
+            output_row[j + 2] = sum2 + residual[element_number + j + 2];
+            output_row[j + 3] = sum3 + residual[element_number + j + 3];
+        }
+        for (; j < cols_b; j++) {
+            float sum = 0.0f;
+            for (size_t k = 0; k < cols_a; k++) {
+                sum += row[k] * B[k * cols_b + j];
+            }
+            output_row[j] = sum + residual[element_number + j];
+        }
+    }
+}
+
 /* Neither kernel supports output overlapping either input. */
-static inline void matmul(
+static inline void matmul_single_core(
     const float* A, size_t rows_a, size_t cols_a,
     const float* B, size_t cols_b,
     float* C
@@ -170,6 +209,28 @@ static inline void matmul(
     matmul_unroll4(A, rows_a, cols_a, B, cols_b, C);
 #else
     matmul_baseline(A, rows_a, cols_a, B, cols_b, C);
+#endif
+}
+
+static inline void matmul(
+    const float* A, size_t rows_a, size_t cols_a,
+    const float* B, size_t cols_b, float* C
+) {
+#if GPT_MULTICORE
+    gpt_multicore_matmul(A, rows_a, cols_a, B, cols_b, NULL, C);
+#else
+    matmul_single_core(A, rows_a, cols_a, B, cols_b, C);
+#endif
+}
+
+static inline void matmul_with_residual(
+    const float* A, size_t rows_a, size_t cols_a,
+    const float* B, size_t cols_b, const float* residual, float* C
+) {
+#if GPT_MULTICORE
+    gpt_multicore_matmul(A, rows_a, cols_a, B, cols_b, residual, C);
+#else
+    matmul_with_residual_single_core(A, rows_a, cols_a, B, cols_b, residual, C);
 #endif
 }
 
@@ -238,12 +299,18 @@ static inline void zero_tensor(float* data, size_t length) {
 /**
  * Apply GELU activation to entire tensor
  */
-static inline void apply_gelu(float* data, size_t length) {
+static inline void apply_gelu_single_core(float* data, size_t length) {
     for (size_t i = 0; i < length; i++) {
-
-        // what if we streamlined the gelu? Interleave all the parts of it
         data[i] = gelu_activation(data[i]);
     }
+}
+
+static inline void apply_gelu(float* data, size_t length) {
+#if GPT_MULTICORE
+    gpt_multicore_gelu(data, length);
+#else
+    apply_gelu_single_core(data, length);
+#endif
 }
 
 /**

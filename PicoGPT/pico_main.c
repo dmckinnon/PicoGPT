@@ -70,6 +70,14 @@ static __attribute__((noinline, noclone)) void benchmark_unroll4(
     matmul_unroll4(a, rows, inner, b, columns, output);
 }
 
+#if GPT_MULTICORE
+static __attribute__((noinline, noclone)) void benchmark_dispatch(
+    const float* a, size_t rows, size_t inner, const float* b, size_t columns, float* output
+) {
+    matmul(a, rows, inner, b, columns, output);
+}
+#endif
+
 static __attribute__((noinline, noclone)) uint64_t time_matmul(
     MatmulKernel kernel, const float* input, size_t rows, size_t inner,
     const float* weights, size_t columns, float* output
@@ -156,6 +164,36 @@ static bool benchmark_matmul(Arena* arena) {
                    shapes[shape].name, rows, inner, columns,
                    (double)baseline_us / MATMUL_REPEATS, (double)unrolled_us / MATMUL_REPEATS,
                    (double)baseline_us / (double)unrolled_us);
+#if GPT_MULTICORE
+            benchmark_unroll4(input, rows, inner, shapes[shape].weights, columns, baseline);
+            for (size_t i = 0; i < rows * columns; i++) unrolled[i] = NAN;
+            benchmark_dispatch(input, rows, inner, shapes[shape].weights, columns, unrolled);
+            for (size_t i = 0; i < rows * columns; i++) {
+                if (!isfinite(unrolled[i]) || baseline[i] != unrolled[i]) {
+                    printf("ERROR: multicore output incomplete or incorrect at %zu.\n", i);
+                    return false;
+                }
+            }
+            for (size_t sample = 0; sample < MATMUL_SAMPLES; sample++) {
+                for (size_t turn = 0; turn < 2; turn++) {
+                    bool dispatch = ((sample + turn) % 2) != 0;
+                    uint64_t elapsed = time_matmul(
+                        dispatch ? benchmark_dispatch : benchmark_unroll4,
+                        input, rows, inner, shapes[shape].weights, columns, baseline);
+                    if (dispatch) baseline_times[sample] = elapsed;
+                    else unrolled_times[sample] = elapsed;
+                }
+            }
+            uint64_t single_us = median_matmul_time(unrolled_times);
+            uint64_t dispatched_us = median_matmul_time(baseline_times);
+            if (!single_us || !dispatched_us) {
+                printf("ERROR: multicore benchmark below timer resolution.\n");
+                return false;
+            }
+            printf("  Multicore %s M=%zu: single %.3f us/call, dispatched %.3f us/call, speedup %.3fx (includes handoff/wait; M=1 stays local).\n",
+                   shapes[shape].name, rows, (double)single_us / MATMUL_REPEATS,
+                   (double)dispatched_us / MATMUL_REPEATS, (double)single_us / dispatched_us);
+#endif
         }
     }
     arena_reset(arena);
@@ -241,8 +279,8 @@ static bool profile_stages_at_length(Arena* arena, const GPTConfig* config, size
 #endif
         "Separate GELU",
         "FFN down + residual",
-        "Final normalization (+allocation)",
-        "All-position logits (+allocation)",
+        "Last-token norm (+allocation)",
+        "Next-token logits (+allocation)",
     };
     const size_t runs = 5;
     int32_t tokens[MAX_SEQ_LEN];
@@ -395,14 +433,19 @@ static bool generate_sample(Arena* arena, const GPTConfig* config) {
 
 static void run_demo(Arena* arena, const GPTConfig* config) {
 #if defined(PICO_COPY_TO_RAM) && PICO_COPY_TO_RAM
-    printf("\nPicoGPT: RP2350 Arm, float32, SRAM code+weights (copied from flash at boot), core 0 only\n");
+    printf("\nPicoGPT: RP2350 Arm, float32, SRAM code+weights (copied from flash at boot)\n");
 #else
-    printf("\nPicoGPT: RP2350 Arm, float32, flash/XIP weights, core 0 only\n");
+    printf("\nPicoGPT: RP2350 Arm, float32, flash/XIP weights\n");
 #endif
     printf("System clock: %" PRIu32 " Hz\n", clock_get_hz(clk_sys));
     printf("Static arena: %zu bytes at %p; token weights at %p\n",
            sizeof(arena_memory), (void*)arena_memory, (const void*)token_embedding);
-    printf("Core 0 stack guard enabled; core 1 is idle. No KV cache.\n");
+#if GPT_MULTICORE
+    printf("Compute: cores 0+1, persistent worker, row-split matmul/residual and element-split GELU.\n");
+    printf("Both stack guards enabled. Softmax, QK scores and final vocabulary projection stay on core 0. No KV cache.\n");
+#else
+    printf("Compute: core 0 only; stack guard enabled; core 1 is idle. No KV cache.\n");
+#endif
 #if GPT_PROFILE_ENABLED
     printf("Profiling build: send 'p' for stage timing and SRAM bus counters; ordinary timings are instrumented.\n");
 #endif
@@ -421,6 +464,7 @@ static void run_demo(Arena* arena, const GPTConfig* config) {
 #else
     printf("Attention: scalar scores, values and mask writes.\n");
 #endif
+    printf("Output head: final position only; transformer blocks still process the full context.\n");
     pico_memory_report("before inference");
     if (gpt_vocab_size != config->vocab_size || gpt_vocab[0] != '\n') {
         printf("ERROR: vocabulary does not match the model/start token.\n");
@@ -441,6 +485,7 @@ int main(void) {
     if (!stdio_init_all()) {
         panic("Could not initialize USB stdio");
     }
+    gpt_multicore_init();
     Arena arena;
     arena_init(&arena, arena_memory, sizeof(arena_memory), 8);
     GPTConfig config = gpt_config_init();
