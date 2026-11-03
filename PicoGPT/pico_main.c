@@ -2,9 +2,11 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "pico/stdlib.h"
 #include "pico/stdio_usb.h"
+#include "pico/rand.h"
 #include "hardware/clocks.h"
 
 #include "gpt_model.h"
@@ -393,45 +395,80 @@ static void run_profile(Arena* arena, const GPTConfig* config) {
         return;
     }
     pico_memory_report("after profiling");
-    printf("Profile complete. Send 'p' to repeat.\n");
+    printf("Profile complete. Enter /profile to repeat.\n");
 }
 #endif
 
-static bool generate_sample(Arena* arena, const GPTConfig* config) {
-    int32_t tokens[NEW_TOKENS + 1] = {0};
+static bool generate_tokens(Arena* arena, const GPTConfig* config,
+                            const int32_t* prompt, size_t prompt_length,
+                            uint32_t seed, bool diagnostics) {
+    if (!prompt_length || prompt_length > MAX_SEQ_LEN ||
+        config->max_seq_len != MAX_SEQ_LEN || config->vocab_size != gpt_vocab_size) {
+        printf("ERROR: invalid prompt length or model configuration.\n");
+        return false;
+    }
+    for (size_t i = 0; i < prompt_length; i++) {
+        if (prompt[i] < 0 || (size_t)prompt[i] >= gpt_vocab_size) {
+            printf("ERROR: invalid prompt token at position %zu.\n", i + 1);
+            return false;
+        }
+    }
+    int32_t context[MAX_SEQ_LEN];
+    memcpy(context, prompt, prompt_length * sizeof(*context));
+    size_t context_length = prompt_length;
     size_t peak = 0;
-    uint64_t elapsed = 0;
-    srand(42);
-    printf("Sample: start=newline, temperature=0.8, seed=42, %d new characters, rolling context=%d:\n",
-           NEW_TOKENS, MAX_SEQ_LEN);
+    uint64_t elapsed = 0, sampling_us = 0;
+    srand(seed);
+    printf("Prompt: \"");
+    for (size_t i = 0; i < prompt_length; i++) {
+        if (gpt_vocab[prompt[i]] == '\n') printf("\\n");
+        else putchar(gpt_vocab[prompt[i]]);
+    }
+    printf("\"\nGeneration: seed=%" PRIu32 ", temperature=0.8, %d new characters, rolling context=%d.\nContinuation:\n",
+           seed, NEW_TOKENS, MAX_SEQ_LEN);
+    size_t generated = 0;
+    bool passed = true;
     uint64_t start = time_us_64();
-    for (size_t generated = 0; generated < NEW_TOKENS; generated++) {
-        size_t length = generated + 1;
-        size_t context_length = length < config->max_seq_len ? length : config->max_seq_len;
-        const int32_t* context = tokens + length - context_length;
+    while (generated < NEW_TOKENS) {
         float* logits = infer(arena, config, context, context_length, &peak, &elapsed);
         if (!logits) {
-            return false;
+            passed = false;
+            break;
         }
+        uint64_t sampling_start = time_us_64();
         int32_t next = sample_token(logits, config->vocab_size, 0.8f);
+        sampling_us += time_us_64() - sampling_start;
         if (next < 0 || (size_t)next >= gpt_vocab_size) {
             printf("ERROR: invalid generated token %" PRId32 ".\n", next);
-            return false;
+            passed = false;
+            break;
         }
-        tokens[length] = next;
+        if (context_length == MAX_SEQ_LEN) {
+            memmove(context, context + 1, (MAX_SEQ_LEN - 1) * sizeof(*context));
+            context_length--;
+        }
+        context[context_length++] = next;
+        generated++;
         putchar(gpt_vocab[next]);
         pico_memory_sample();
     }
     uint64_t wall_elapsed = time_us_64() - start;
-    printf("\nInference total: %" PRIu64 " us (%.3f ms) for %d generated tokens (excludes sampling/printing).\n",
-           elapsed, (double)elapsed / 1000.0, NEW_TOKENS);
-    printf("Generation wall time: %" PRIu64 " us (%.3f ms), including sampling, printing and diagnostics.\n",
+    printf("\nModel processing: %" PRIu64 " us (%.3f ms) for %zu generated tokens (inference only).\n",
+           elapsed, (double)elapsed / 1000.0, generated);
+    printf("Token sampling: %" PRIu64 " us (%.3f ms).\n", sampling_us, (double)sampling_us / 1000.0);
+    printf("Total generation: %" PRIu64 " us (%.3f ms), including model, sampling, printing and bookkeeping.\n",
            wall_elapsed, (double)wall_elapsed / 1000.0);
-    printf("Generation arena peak: %zu/%zu bytes.\n", peak, arena->size);
-    return true;
+    if (diagnostics) printf("Generation arena peak: %zu/%zu bytes.\n", peak, arena->size);
+    if (!passed) printf("ERROR: generation stopped after %zu of %d new characters.\n", generated, NEW_TOKENS);
+    return passed;
 }
 
-static void run_demo(Arena* arena, const GPTConfig* config) {
+static bool generate_sample(Arena* arena, const GPTConfig* config) {
+    const int32_t prompt[] = {0};
+    return generate_tokens(arena, config, prompt, 1, 42, true);
+}
+
+static void run_benchmarks(Arena* arena, const GPTConfig* config) {
 #if defined(PICO_COPY_TO_RAM) && PICO_COPY_TO_RAM
     printf("\nPicoGPT: RP2350 Arm, float32, SRAM code+weights (copied from flash at boot)\n");
 #else
@@ -447,7 +484,7 @@ static void run_demo(Arena* arena, const GPTConfig* config) {
     printf("Compute: core 0 only; stack guard enabled; core 1 is idle. No KV cache.\n");
 #endif
 #if GPT_PROFILE_ENABLED
-    printf("Profiling build: send 'p' for stage timing and SRAM bus counters; ordinary timings are instrumented.\n");
+    printf("Profiling build: enter /profile for stage timing and SRAM bus counters; ordinary timings are instrumented.\n");
 #endif
 #if GPT_MATMUL_UNROLL4
     printf("Model matmul: four outputs at once.\n");
@@ -477,7 +514,151 @@ static void run_demo(Arena* arena, const GPTConfig* config) {
         return;
     }
     pico_memory_report("after generation");
-    printf("Demo complete. Send 'r' to repeat.\n");
+    printf("Benchmarks complete. Enter /bench to repeat the fixed-seed run.\n");
+}
+
+typedef struct {
+    int32_t tokens[MAX_SEQ_LEN];
+    size_t length;
+    uint32_t seed;
+    bool valid;
+} GenerationRequest;
+
+typedef struct {
+    char line[MAX_SEQ_LEN + 1];
+    size_t length;
+    bool discard;
+    bool ignore_lf;
+} SerialInput;
+
+static GenerationRequest last_request;
+
+static bool encode_prompt(const char* text, int32_t* tokens, size_t* length) {
+    size_t count = strlen(text);
+    if (!count || count > MAX_SEQ_LEN) {
+        printf("ERROR: prompt must contain 1 to %d characters; nothing generated.\n", MAX_SEQ_LEN);
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        size_t token = 0;
+        while (token < gpt_vocab_size && gpt_vocab[token] != text[i]) token++;
+        if (token == gpt_vocab_size) {
+            printf("ERROR: unsupported character 0x%02x at position %zu; vocabulary is case-sensitive. Nothing generated.\n",
+                   (unsigned int)(unsigned char)text[i], i + 1);
+            return false;
+        }
+        tokens[i] = (int32_t)token;
+    }
+    *length = count;
+    return true;
+}
+
+static void print_help(void) {
+    printf("Type a prompt of 1-%d supported characters, then Enter, for %d NEW characters.\n",
+           MAX_SEQ_LEN, NEW_TOKENS);
+    printf("/random  Fresh sample from one newline token\n"
+           "/repeat  Reuse the last prompt and seed\n"
+           "/bench   Matmul benchmarks, reference check, fixed seed-42 generation and memory\n"
+           "/memory  Runtime memory report\n"
+           "/profile Stage/bus profiling (profiling build required)\n"
+           "/help    Show this help\n");
+    printf("Empty lines do nothing. Backspace edits; Ctrl-C cancels the input line.\n");
+}
+
+static void handle_line(Arena* arena, const GPTConfig* config, const char* line) {
+    if (!line[0]) return;
+    if (strcmp(line, "/help") == 0) {
+        print_help();
+    } else if (strcmp(line, "/bench") == 0) {
+        run_benchmarks(arena, config);
+    } else if (strcmp(line, "/memory") == 0) {
+        pico_memory_report("requested");
+    } else if (strcmp(line, "/profile") == 0) {
+#if GPT_PROFILE_ENABLED
+        run_profile(arena, config);
+#else
+        printf("ERROR: /profile requires a build with GPT_PROFILE_ENABLED=ON.\n");
+#endif
+    } else if (strcmp(line, "/repeat") == 0) {
+        if (!last_request.valid) {
+            printf("ERROR: no previous prompt or /random run to repeat.\n");
+            return;
+        }
+        generate_tokens(arena, config, last_request.tokens, last_request.length,
+                        last_request.seed, false);
+    } else {
+        GenerationRequest request = {0};
+        if (strcmp(line, "/random") == 0) {
+            request.tokens[0] = 0;
+            request.length = 1;
+        } else if (line[0] == '/') {
+            printf("ERROR: unknown command; enter /help.\n");
+            return;
+        } else if (!encode_prompt(line, request.tokens, &request.length)) {
+            return;
+        }
+        request.seed = get_rand_32();
+        if (generate_tokens(arena, config, request.tokens, request.length, request.seed, false)) {
+            request.valid = true;
+            last_request = request;
+        }
+    }
+}
+
+static void print_ready(void) {
+    printf("pico> ");
+    fflush(stdout);
+}
+
+static void serial_connected(SerialInput* input) {
+    memset(input, 0, sizeof(*input));
+    printf("\nPicoGPT ready. Character vocabulary: %zu tokens; context: %d; generation: %d new tokens.\n",
+           gpt_vocab_size, MAX_SEQ_LEN, NEW_TOKENS);
+#if GPT_PROFILE_ENABLED
+    printf("NOTE: profiling build; timings include instrumentation overhead.\n");
+#endif
+    print_help();
+    print_ready();
+}
+
+static void serial_character(SerialInput* input, int character, Arena* arena, const GPTConfig* config) {
+    if (character < 0) return; /* Serial read timeout. */
+    if (character == '\n' && input->ignore_lf) {
+        input->ignore_lf = false;
+        return;
+    }
+    input->ignore_lf = character == '\r';
+    if (character == '\r' || character == '\n') {
+        putchar('\n');
+        if (!input->discard) {
+            input->line[input->length] = '\0';
+            handle_line(arena, config, input->line);
+        }
+        input->length = 0;
+        input->discard = false;
+        print_ready();
+    } else if (character == 3) {
+        input->length = 0;
+        input->discard = false;
+        printf("^C\n");
+        print_ready();
+    } else if (input->discard) {
+        return;
+    } else if (character == '\b' || character == 127) {
+        if (input->length) {
+            input->length--;
+            printf("\b \b");
+        }
+    } else if (character < 32 || character > 126) {
+        printf("\nERROR: serial input must be printable ASCII; line discarded. Press Enter or Ctrl-C.\n");
+        input->discard = true;
+    } else if (input->length == MAX_SEQ_LEN) {
+        printf("\nERROR: input exceeds %d characters; line discarded. Press Enter or Ctrl-C.\n", MAX_SEQ_LEN);
+        input->discard = true;
+    } else {
+        input->line[input->length++] = (char)character;
+        putchar(character);
+    }
 }
 
 int main(void) {
@@ -489,6 +670,10 @@ int main(void) {
     Arena arena;
     arena_init(&arena, arena_memory, sizeof(arena_memory), 8);
     GPTConfig config = gpt_config_init();
+    if (gpt_vocab_size != config.vocab_size || gpt_vocab[0] != '\n') {
+        panic("Vocabulary does not match model/start token");
+    }
+    SerialInput input = {0};
     bool connected = false;
     while (true) {
         if (!stdio_usb_connected()) {
@@ -498,16 +683,9 @@ int main(void) {
         }
         if (!connected) {
             connected = true;
-            run_demo(&arena, &config);
+            serial_connected(&input);
         }
         int command = getchar_timeout_us(20000);
-        if (command == 'r') {
-            run_demo(&arena, &config);
-        }
-#if GPT_PROFILE_ENABLED
-        if (command == 'p') {
-            run_profile(&arena, &config);
-        }
-#endif
+        serial_character(&input, command, &arena, &config);
     }
 }

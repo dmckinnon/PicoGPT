@@ -12,11 +12,14 @@ There's so many considerations involved in this:
 So, where to start? 
 
 ## Contents
+- [Build and serial usage](#build-and-serial-usage)
 - [Model structure, size, and training](#model-structure-size-and-training)
 - [Porting from tflite to C++](#porting-from-tflite-to-c)
 - [Can this run at all](#can-this-run-at-all)
-- [Optimisations]()
-- [Conclusion]()
+- [Optimisations](#optimisations)
+- [Circuit design and fabrication](#circuit-design-and-fabrication)
+- [Conclusion](#conclusion)
+- [Usage](#usage)
 
 ## Model structure, size, and training
 First, can we even create a model that's really small and does something useful. I set myself a size budget of 100Kb - as in the model file (all model parameters) could not be larger than this - and twiddled with the base model. But what should we train it on? 100Kb model, predicting Shakespeare? That's boring, that's not much Shakespeare and also who cares. Some other pithy quotes? Amusing, but no. 
@@ -352,10 +355,187 @@ So to wrap this up, I was happy with the speed and quality of floating point, an
 
 For now, I'm considering optimisation done.
 
-## Circuit design and fabrication
-I'm using the same basic concept for the board as with my previous
 
-I used PCBWay for this
+## Circuit design and fabrication
+I'm using the same basic concept for the board as with my previous [card](https://dmckinnon.github.io/ML-Business-card/) - the USB C port in the corner, thin enough to slot into a USB male connector. There's a couple of big differences:
+
+<image>
+
+1. This uses the RP2354, not RP2350. What's the difference? The 2354 has 2MB of flash built in, instead of needing an external flash chip. It's not much, and I have spare flash chips sitting around, but it makes circuit design and routing just that little bit simpler
+2. I'm breaking out all the rest of the chip's GPIO. The intention here is that this board is reusable as a Raspberry Pi Pico 2 dev board, just a nice touch to whoever you give this away to, OR if I just happen to need another dev board and my main one is tied up in another project. Reusability is nice. 
+
+I used [PCBWay](www.pcbway.com) for fabrication. I've talked about [using them before](), and choose them each time. It's such an easy interface and experience:
+
+<picture>
+
+- to get a quote, just put in board dimensions and other details like colour, and approximate price is ready for you
+- to get the board itself, upload your files as a zip, there might be some clarification but they'll help you through issues
+- board is at your door not long after. They even have the option of doing all the components for you (i still do this myself, but it's just a preference)
+
+Here's the finished board! 
+
+<image>
+
+It's easy to flash, and I'm realy happy with Raspberry Pi for this one - holding the BOOTSEL button puts it in flashing mode and it appears as a storage device on the computer. Drag and drop the binary, it reboots, and then runs. See below for [Usage](#usage)
 
 ## Conclusion
+I'm really pleased with how this turned out. I never got to the original idea that kicked it off - using the DSP to accelerate a quantised version to reasonable speeds - but this was still fun.\
+The model is definitely smaller than it could be, and considerably overfit, so it comes across as too regurgitative of the training data. But the optimisations drastically speed things up, and that proves a good initial point - I could use a much bigger model, and still get reasonable speed. \
+Other tech workers have seen this demonstrated and were delighted or impressed at the concept and execution, also proving the point that it's a useful exercise and gets the attention of a potential hiring manager. 
 
+### What next
+As mentioned, the model is small and overfit, and runs far faster than necessary. Given that the chip I used has 2Mb flash, what I'd like to try next is a _much_ bigger model - perhaps a whole megabyte, perhaps even more. I'd practically write my biography, so far more detail and training data, and have it learn that to answer any query deeply. Then there's problems to reckon with like paging the weights in and out of flash with one core while the other core performs matmuls, and we might need to make more serious optimisations, cos there's so much more model to process. It'll run a whole lot slower, but this would be a fun test of just how big I can go and maintain something like, say, 10 tokens per second generation speed. 
+
+### A note about AI usage
+
+
+## Usage
+
+### Build and serial usage
+
+### Makefile versus CMake
+
+There are two build entry points in [PicoGPT/](PicoGPT/), targeting different
+machines:
+
+| Entry point | Purpose | Output |
+|-------------|---------|--------|
+| [Makefile](PicoGPT/Makefile) | Hand-written rules for native GCC, tests and extraction | Linux/host executables such as `gpt_model` |
+| [CMakeLists.txt](PicoGPT/CMakeLists.txt) | Configure the Pico SDK, cross-compiler, board, libraries and memory layout | RP2350 firmware: ELF, UF2, map file |
+
+Make executes build rules. CMake generates those rules for a backend such as
+Make or Ninja. Thus the Pico build can also contain a generated Makefile,
+but it is not the hand-written host Makefile. Use `cmake --build <directory>`
+so CMake invokes the correct backend; plain `make` in this source directory
+builds the host program, not the Pico firmware.
+
+The [shell wrapper](PicoGPT/build_and_run.sh) now deliberately builds and runs
+the native host demo. Firmware must be copied to the Pico rather than executed
+as a Linux program.
+
+Native commands (run in WSL for this checkout):
+
+```sh
+cd "$HOME/PicoGPT/PicoGPT"
+make -B gpt_model
+./gpt_model
+# Equivalent host build/run:
+bash build_and_run.sh
+
+# Numerical tests, with the current dual-core dispatch exercised on host threads:
+make parity-test PYTHON=./gpt_venv/bin/python \
+  CFLAGS='-Wall -Wextra -Werror -O2 -std=c99 -ffp-contract=off -DGPT_MATMUL_UNROLL4=1 -DGPT_ATTENTION_UNROLL4=1 -DGPT_FFN_FUSE_GELU=0 -DGPT_MULTICORE=1'
+```
+
+The host demo is still a diagnostic program. The interactive USB console below
+is implemented in [pico_main.c](PicoGPT/pico_main.c).
+
+### Interactive Pico 2 firmware
+
+Configure the SRAM-resident, dual-core, separate-GELU, unrolled implementation:
+
+```sh
+cd "$HOME/PicoGPT/PicoGPT"
+cmake -S . -B build/pico-serial-2.3.1 \
+  -DPICO_SDK_PATH="$HOME/.pico-sdk/sdk/2.3.1" \
+  -DPICO_TOOLCHAIN_PATH="$HOME/.pico-sdk/toolchain/15_2_Rel1" \
+  -DPICO_BOARD=pico2 -DCMAKE_BUILD_TYPE=Release \
+  -DPICO_DEFAULT_BINARY_TYPE=copy_to_ram \
+  -DPICOTOOL_FORCE_FETCH_FROM_GIT=ON \
+  -DGPT_MATMUL_UNROLL4=ON -DGPT_ATTENTION_UNROLL4=ON \
+  -DGPT_FFN_FUSE_GELU=OFF -DGPT_MULTICORE=ON -DGPT_PROFILE_ENABLED=OFF
+cmake --build build/pico-serial-2.3.1 --parallel 4
+```
+
+SDK/compiler paths are specific to the local installation; adjust them on
+another machine. The toolchain host architecture here is aarch64. The
+`PICOTOOL_FORCE_FETCH_FROM_GIT` option builds the SDK's build-only picotool,
+avoiding the extension-provided executable's missing `libusb` dependency in
+this WSL environment. The first configuration needs network access.
+
+After configuration, only the `cmake --build ...` command is needed to rebuild.
+Use a new build directory when changing SDK/compiler versions to avoid mixing
+cached paths.
+
+The flashable image is `PicoGPT/build/pico-serial-2.3.1/PicoGPT.uf2`.
+Hold BOOTSEL while connecting the Pico 2, copy the UF2 onto its RP2350 drive,
+and then open the USB serial port. A 115200 baud terminal setting is conventional
+(USB CDC is not clocked by that UART setting). Enable DTR, disable local echo,
+and send lines terminated by CR, LF or CRLF. In WSL, Windows may own the serial
+device; using a Windows terminal is fine.
+
+On connection, the firmware shows help and `pico>`. It does **not** automatically
+run benchmarks or generate text.
+
+| Input, followed by Enter | Behavior |
+|--------------------------|----------|
+| `/random` | Generate 100 new characters from a single newline token with a fresh seed |
+| `What did he study?` | Generate 100 new characters using that exact prompt |
+| `/repeat` | Reuse the last successful prompt and seed |
+| `/bench` | Run matmul benchmarks, reference check, seed-42 generation and memory reports |
+| `/memory` | Print current runtime memory diagnostics |
+| `/profile` | Run stage and SRAM-bus profiling, if compiled in |
+| `/help` | Show commands and input limits |
+
+The former immediate `r` and `p` shortcuts are replaced by slash commands so
+ordinary prompt characters are not intercepted. Commands require Enter.
+Backspace/DEL edits a line; Ctrl-C cancels the **input line**, not an inference
+already running. Empty lines do nothing. Wait for `pico>` before sending the
+next request; there is no concurrent command-input task during generation.
+
+Prompts must contain **1-31 characters** from the exact, case-sensitive
+[47-character vocabulary](PicoGPT/gpt_vocab.c). Unsupported characters are
+rejected with their byte value and position. Non-ASCII/control input and lines
+longer than 31 characters are rejected as whole lines, never silently truncated.
+After such an error, press Enter or Ctrl-C to start a new line. Reconnecting
+clears a partially entered line.
+
+Every successful request produces **100 new model-sampled characters**, not
+100 total characters including the prompt. The model uses the latest 31 tokens
+as a rolling context. Temperature remains 0.8. `/random` and custom prompts
+obtain a seed from the SDK `pico_rand` API, using RP2350 entropy sources, and
+print that seed. Output is sampled from model probabilities, not from a uniform
+character distribution. Different seeds may still produce the same text.
+`/repeat` is reproducible with the same firmware; it survives a serial reconnect,
+not a power cycle. `/bench`, errors and diagnostic commands do not overwrite
+the remembered prompt/seed.
+
+### Timing and writeup measurements
+
+Each generation prints three separate figures:
+
+- **Model processing:** time inside `gpt_inference` across all new tokens,
+  excluding sampling, output and input entry.
+- **Token sampling:** time selecting tokens from the logits, including the
+  sampling softmax and RNG calls, excluding text output.
+- **Total generation:** elapsed generation-loop time including model calls,
+  validation, sampling, output calls, context updates and bookkeeping.
+  This excludes seed acquisition, the printed header, and typing the prompt;
+  it does not guarantee all buffered USB output has reached the terminal.
+
+These are elapsed times on core 0, not sums of both cores' CPU time. Inference
+includes the completion wait for parallel kernels. A failed generation
+explicitly reports failure, the number of characters completed, and timings
+for the attempted work. Normal runs omit benchmark and arena dumps; `/bench`
+retains those measurements and the fixed seed 42 for repeatable writeup runs.
+
+An interactive profiling image is also available at
+`PicoGPT/build/pico-serial-profile-2.3.1/PicoGPT.uf2`. To rebuild it, use the
+same configuration command with `-B build/pico-serial-profile-2.3.1` and
+`-DGPT_PROFILE_ENABLED=ON`, then build that directory. Send `/profile` and
+Enter. Profiling changes code layout and timing even when capture is inactive;
+use the nonprofiling image for final performance figures.
+
+Both images retain the 144 KiB arena (observed model peak **107,216 bytes**)
+and guarded 4 KiB stacks for each core. The first interactive build reserves
+**311,484 bytes of main RAM** and uses **159,264 bytes of flash**. The profiling
+variant reserves **315,772 bytes of main RAM** and uses **163,344 bytes of flash**.
+Stack reservations are in separate scratch banks and are additional to the
+main-RAM figures. These sizes are build-specific.
+
+All 22 host tests pass in multicore mode, including numerical comparisons for
+prompted generation, line limits/editing/reconnection, random-seed replay,
+on-demand diagnostics, and timing accounting. AddressSanitizer and
+UndefinedBehaviorSanitizer also pass. Host serial/RNG/clock shims validate logic,
+not USB hardware behavior, entropy quality, or on-board timing; those still
+require testing this image on the Pico.

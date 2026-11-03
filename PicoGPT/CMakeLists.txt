@@ -42,7 +42,7 @@ endif()
 
 add_executable(PicoGPT pico_main.c pico_memory.c gpt_vocab.c)
 target_include_directories(PicoGPT PRIVATE ${CMAKE_CURRENT_LIST_DIR})
-target_link_libraries(PicoGPT pico_stdlib hardware_clocks m)
+target_link_libraries(PicoGPT pico_stdlib pico_rand hardware_clocks m)
 if(GPT_MULTICORE)
     target_sources(PicoGPT PRIVATE gpt_multicore.c)
     target_link_libraries(PicoGPT pico_multicore)
