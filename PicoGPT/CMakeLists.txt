@@ -34,10 +34,20 @@ option(GPT_MATMUL_UNROLL4 "Use four-output matmul in model inference" OFF)
 option(GPT_FFN_FUSE_GELU "Fuse GELU into the residual FFN up-projection" ON)
 option(GPT_ATTENTION_UNROLL4 "Unroll attention scores, mask and weighted values by four" OFF)
 option(GPT_PROFILE_ENABLED "Enable inference stage timing and SRAM bus diagnostics" OFF)
+option(GPT_MULTICORE "Use a persistent core-1 worker for matmul, residual matmul and GELU" OFF)
+
+if(GPT_MULTICORE AND (GPT_FFN_FUSE_GELU OR NOT GPT_MATMUL_UNROLL4 OR NOT GPT_ATTENTION_UNROLL4))
+    message(FATAL_ERROR "Multicore comparison requires separate GELU and both four-output unroll options.")
+endif()
 
 add_executable(PicoGPT pico_main.c pico_memory.c gpt_vocab.c)
 target_include_directories(PicoGPT PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 target_link_libraries(PicoGPT pico_stdlib hardware_clocks m)
+if(GPT_MULTICORE)
+    target_sources(PicoGPT PRIVATE gpt_multicore.c)
+    target_link_libraries(PicoGPT pico_multicore)
+    target_compile_definitions(PicoGPT PRIVATE PICO_CORE1_STACK_SIZE=0x1000)
+endif()
 target_compile_options(PicoGPT PRIVATE
     -Wall -Wextra -O2 -fstack-usage -ffp-contract=off
 )
@@ -48,6 +58,7 @@ target_compile_definitions(PicoGPT PRIVATE
     GPT_FFN_FUSE_GELU=$<BOOL:${GPT_FFN_FUSE_GELU}>
     GPT_ATTENTION_UNROLL4=$<BOOL:${GPT_ATTENTION_UNROLL4}>
     GPT_PROFILE_ENABLED=$<BOOL:${GPT_PROFILE_ENABLED}>
+    GPT_MULTICORE=$<BOOL:${GPT_MULTICORE}>
 )
 target_link_options(PicoGPT PRIVATE -Wl,--print-memory-usage)
 

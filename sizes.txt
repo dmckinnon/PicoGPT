@@ -1,0 +1,8 @@
+	Our PicoGPT model	nanoGPT default
+Learned parameters	27,232	≈124 million
+Transformer blocks	2	12
+Attention heads per block	1	12
+Embedding width	32	768
+Vocabulary	47 characters	50,304 entries, padded GPT-2 vocabulary
+Maximum context	31 tokens	1,024 tokens
+Float32 parameter storage	107 KiB*	≈475 MiB
