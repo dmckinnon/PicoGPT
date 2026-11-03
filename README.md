@@ -158,6 +158,10 @@ There are a number of optimisations I have in mind: multithreading, unrolling, r
 
 ## Optimisations
 
+There are several benchmarks I'm using here. For some things like matrix multiplication, we can easily creawte a standalone benchmark. I'm also giving the model a small prompt and generating 100 output tokens based on this prompt, and we'll see how that is affected each time. 
+
+All optimisations were also checked for accuracy, both on numerical benchmarks (computing matrices etc) and also checking token-generation output. Logits changed slightly, but never enough to change probabilities. Only optimisations that maintain this accuracy are considered. 
+
 TODO get most of this from the chat history at work
 
 ### Cache-coherent matmul
@@ -226,6 +230,9 @@ Does it? Let's take a look at the results:
 
 As expected, we get gainz. That's enormous though! 
 
+What can be unrolled?\
+Any loop, really. Matrix multiplications, elementwise operations like tensor addition or GELU, parts of the softmax function. Unroll everything!
+
 
 
 
@@ -251,16 +258,102 @@ I dug a bit but not enough to properly figure it out. It was faster than the sin
 
 
 ### Removing Intermediates/Fusing
+The concept behind this idea is that we are constantly performing an operation, like adding two tensors, and then writing the result out to a third tensor in memory. The next operation will read this back from memory, perform something else on it, like some elementwise operation, and then write it back out again. \
+There's a lot of inefficiency here. What if we fused the two? That is, what if we didn't have the intermediate tensor?\
+For example, after FFN we have the residual skip-layer, where we add the tensor from the start of the layer back into the result from the layer. We could complete the matmul, write that out, and then loop through the tensor again and element-wise add. \
+Or\
+We could, while performing the matmul, add the residual to the layer-input tensor at the output of the matmul, and thereby avoid a whole separate iteration through the tensor?
+
+let's see this in code:
+
+```
+Before:
+for (rows of B)
+    for (cols of A)
+        for (elems in dot product)
+            C[i] += a*b
+
+for (elems in tensor)
+    C[i] += input[i]
+
+
+After:
+for (rows of B)
+    for (cols of A)
+        for (elems in dot product) 
+            C[i] += a*b
+            C[i] += input[i]
+```
+We still have to do all the operations, but what this saves is all the loop overhead - not just in an unrolling fashion, but ALL the loop overhead of a second loop. \
+We can do this for the two residual skip-connections, and also the GELU operation in the middle of the FFN. 
+
+Let's check these separately:
+
+<Skip-connections>
+
+<GELU>
+
+So the skip connection fusing works well. Why doesn't GELU? <something about the full erff??>
+
+Oh well. We can still unroll the GELU and get an already-proven win there. 
+
 
 ### KV Cache
 
+
 ### Ignoring unused output
+In the base implementation, we compute a whole vector of output logits, softmax to get the probabilities per index, and then choose a token per index. But previous indices have already been computed! We only need the last token. 
+
+Simple: don't softmax the whole vector, just the last entry, and then only compute for this token. Removes unneeded compute. 
+
+Let's check the speedup we get:
+
+
+Saves a few hundred milliseconds over the 100 token generation. Not terrible, not great - much like reading 3.6 roentgens. But it causes no harm, and it is objectively faster, so we'll keep it. 
 
 ### Multithreading
+Another seemingly obvious win. Until now, all algorithms have run on a single core - which we needed to clearly know what the speedup was, so this one has to come last. 
+
+The Cortex M33 has two cores, each with a floating point coprocessor. There are no CPU caches, as mentioned previously, and both cores just read and write directly to SRAM. All we need to do is split the loops we intend to multi-thread correctly so no memory contention occurs, and this should just fall into place. We'll multithread the matrix multiplication loops - unrolled and with fused intermediates, so this means multithreading several implementations - and try the elementwise GELU loop. The softmax ... is finicky enough and doesn't take enouhg time for this to be worth it. I profiled the whole thing, and matmul dominates. Softmax was a mere 5% of time, to the ~60% of time spent on matmul. 
+
+How should we split up the matrix multiplication? GELU loop is easy - first half to one core, second half to other core. Matrices, though - the cores need to share one matrix entirely. \
+The way that sounds best on paper is, for $C = A\times B$, to split $A$ between the two cores, share $B$, and then also split the output $C$. The split would occur vertically through the matrix:
+
+```
+
+do this in latex
+
+```
+
+Because matrices are laid out linearly, row-major, this means that we give one linear array to each core:
+
+```
+A = [a_00 .... a0n a10 ... a1n ... a_m/20...am/2n] 
+```
+
+simple split, and we don't have to stress about cache coherency because no caches. The output matrix C is split similarly. \
+There's some nuance I'm brushing over here with setting up the second core to run, passing jobs to it, etc, but we don't need to go into that. The code is simple enough, and the point here is the theory of splitting and multithreading.
+
+Let's take a look at the results:
+
+A clear win. We didn't really expect anything else - doing half the work simultaneously with the other half of the work, with minimal overhead.
 
 ### Quantisation
+"I thought multithreading was the last optimisation"\
+It is. I didn't end up doing quantisation, but it's here because it's a well known one, and a major one to consider. 
+
+Quantisation is where instead of using floating point values for all inputs, outputs, and computation, we get the range of values we expect and squash all values in between into a range of 256 - so 8 bits. Now we are computing on 8 bits, and storing on 8 bits. The model is smaller, we can compute faster (while the FPU does handle arithmetic in a small number of clock cycles, the DSP engine in the Cortex M33 allows us to do arithmetic on 4 separate bytes simultaneously, giving us a speedup of nearly 4 within things like matrix multiplication). 
+
+However, this comes with a significant accuracy hit. How bad?\
+I did not quantify. After I saw the results we get from the above optimisations chained together, I ... didn't feel like quantisation added anything. Yes, I could potentially get another speedup, but this was already more than fast enough and from experience this could take an accuracy hit of up to 30%? Maybe worse?\
+Large models quantise far more viciously, down to 2 or 1 bit, but they have enough parameters to overcome this brutally tight quantisation. I could therefore make a larger model and quantise it harder ... and this is a subject of later discussion.
+
+So to wrap this up, I was happy with the speed and quality of floating point, and did not see a need. The original motivation for this project was indeed to use the DSP acceleration of int8 arithmetic, but ... now I want to try other things. See the conclusion for more details. 
+
+For now, I'm considering optimisation done.
 
 ## Circuit design and fabrication
+I'm using the same basic concept for the board as with my previous
 
 I used PCBWay for this
 
