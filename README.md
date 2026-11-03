@@ -141,9 +141,10 @@ Now all we need to do is connect those parts ...
 
 <code>
 
-and that;s the whole model! 
+and thats the whole model! 
 
 ## Can this run at all
+
 Is it actually that simple? Well, let's see if this runs at all. While for my first ML-on-business-card I used the [RP2040](), this does software emulation of floating point hardware - that is, floating point math is actually done with 32-bit integers emulating what a dedicated floating point logic gate circuit would do. This will work, but be slow. Coincidentally, the next generation, the [RP2350]() chip had just come out, and this came with a FPU coprocessor - floating point hardware! So floating point arithmetic could be performed in a single clock cycle. A dev board was acquired, a compiler was run (and run and run and run and eventually the code compiled), a chip was flashed, aaaaaand ...
 
 <results, speed>
@@ -166,9 +167,88 @@ A nice idea in theory; it turns out, from the [datasheet](https://support.arm.co
  
 
 ### SRAM Residency
+The RP2350 fetches weights from flash and places them into SRAM to do the matrix calculations. There is a 16 KiB cache for this, buuuuut ... what if we avoided that fetch? Each fetch from flash has a delay due to the cache (could have a miss) and the QSPI memory interface. It's not large, but we have 500Kb of SRAM and a 107Kb model. We can fit this entirely within RAM once upon startup - incurring a one-time cost - but then reuse weights with abandon, processing as many new tokens as we see fit without any extra fetch overhead. 
 
+Here's the code:
+
+Here's the timing, with and without:
+
+A considerable improvement! An expected one, but nonetheless rewarding to see. 
 
 ### Unrolling
+This is essentially pipelining loops. Consider a standard matmul loop:
+
+```
+for (B matrix rows)
+    for (A matrix cols)
+        for (C matrix position)
+            C[i,j] += a*b
+```
+
+In the inner-most loop, we do one multiplication, one addition, one store, and then check loop conditions, have a potential branch, and set up the loop again. There's almost as much overhead as there is loop calculation!
+
+What if we were to do more per loop? Consider:
+
+```
+for (B matrix rows)
+    for (4 A matrix cols)
+        for (4 C matrix positions)
+            C[i_1,j_1] += a_1*b_1
+            C[i_1,j_1] += a_1*b_1
+            C[i_1,j_1] += a_1*b_1
+            C[i_1,j_1] += a_1*b_1
+```
+
+We've essentially batched this matmul, doing 4 at a time. Obviously this requires the size to be divisible by 4, but we know the size a priori so we can make this work. Now we do 4 multiplications and 4 additions per loop overhead! The multiplications in the Floating Point coprocessor take a couple of cycles, but there are multiple floating-point registers we can use so these multiplies can be pipelined so we hide the delay on those registers behind the next multiply:
+
+```
+Example pipeline of 2
+
+Before:
+cycle 1: R0 = R1*R2
+cycle 2: R0 locked behind second cycle  of multiply, nothing happens
+cycle 3: R4 += R0
+cycle 4: loop stuff
+
+After:
+cycle 1: R0 = R1*R2
+cycle 2: R0 locked, R5 = R6*R7
+cycle 3: R4 += R0, R5 locked
+cycle 4: R8 += R5
+cycle 5: loop stuff
+```
+
+In this 'after', there's no cycle where we are just waiting - we're always doing something. This may seem small, but recall it's the inner loop of three nested loops so this happens a lot. And that's just one matmul, of three matmuls per layer, for two layers, per token. The time difference should add up. 
+
+Does it? Let's take a look at the results:
+
+<results>
+
+As expected, we get gainz. That's enormous though! 
+
+
+
+
+### Fused FMA
+Can we make the inner loop of matmuls even faster? Until now, this inner loop of the matrix multiplication has been using two instructions: floating point multiply, and floating point add. \
+But there's an important feature in this floating point coprocessor: [Fused Multiply-Accumulate](https://pip-assets.raspberrypi.com/categories/1214-rp2350/documents/RP-008373-DS-3-rp2350-datasheet.pdf)! (Section 3.7.2.4)
+
+This does exactly as it sounds, performing a multiply and accumulate (+=) all in one instruction. This should make our inner loop have half the number of instructions! That's twice as fast! It's a relatively simple change, just a compiler flag:
+
+TODO
+
+And this will replace floating point multiplies followed by accumulates with the single instruction. 
+
+Check results:
+
+Oh.\
+This is slower.\
+Hmm. \
+Why is this slower?
+
+I dug a bit but not enough to properly figure it out. It was faster than the single-multiple-accumulate per loop, but not faster than unrolling. My theory is that it uses more registers and slowed down the unrolled version with register swaps? No evidence to support this. I could dig into the assembly, but we got such a massive win from unrolling and there's more to try that if all else fails I'll come back, but otherwise ... meh. Chalk this one up as a loss. 
+
+
 
 ### Removing Intermediates/Fusing
 
