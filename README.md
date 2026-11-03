@@ -14,9 +14,9 @@ So, where to start?
 ## Contents
 - [Model structure, size, and training](#model-structure-size-and-training)
 - [Porting from tflite to C++](#porting-from-tflite-to-c)
-- Can this run at all
-- Optimisations
-- Results
+- [Can this run at all](#can-this-run-at-all)
+- [Optimisations]()
+- [Conclusion]()
 
 ## Model structure, size, and training
 First, can we even create a model that's really small and does something useful. I set myself a size budget of 100Kb - as in the model file (all model parameters) could not be larger than this - and twiddled with the base model. But what should we train it on? 100Kb model, predicting Shakespeare? That's boring, that's not much Shakespeare and also who cares. Some other pithy quotes? Amusing, but no. 
@@ -32,7 +32,8 @@ If we just run the prompts Karpathy has given us, to predict Shakespeare, then w
 - 6 layers in the model
 - 6 attention heads
 - 384 embedding dimensions
-- X final parameters (TODO need to get this working)
+- ~ 10 million parameters
+- ~40Mb in storage as float
 
 This results in a model of size Y
 
@@ -65,58 +66,20 @@ Couple notes:
 
 I played around with parameters. How many heads? How many embedding dimensions? How many layers? There are so many experiments to run, and I definitely did not exhaustively find the best set of parameters. But that's not my goal - I just want _something that works_. I found that the following worked:
 
-- 2 attention heads
+- 1 attention head per layer
 - 2 layers
-- context length 32, using a sliding window context
+- 32 embedding width
+- context length 31, using a sliding window context
+- 27 232 parameters
+- 107Kb in storage as float
 
 By "worked" here I mean:
 - it produced reasonable predictions when prompted. Sentences like "<todo>"
-- it fit within the memory budget I have: X kb
+- it "fits" within the memory budget I have: 100Kb (ok it's 107Kb but this is close enough, I'm going to work with it)
 
 This is a good start! Maybe I want to return to this step for a better model, but this easily fits within the flash we have - 4Mb, the matrices for individual steps fit within the RAM budget, and the results look good. So before I stress too much over getting the perfect model, let's attempt implementation. 
 
 
-
-Shakespeare stats: length of dataset in characters: 1,115,394
-all the unique characters: 
- !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
-vocab size: 65
-train has 1,003,854 tokens
-val has 111,540 tokens
-
-##### baby GPT model :)
-n_layer = 6
-n_head = 6
-n_embd = 384
-dropout = 0.2
- 10.65M params
-
-
-My data:
-
-David studied at UNSW Univeristy of New South Wales from 2012 to 2016
-What did he study?
-He studied engineering and mathematics, focusing in robotics and computer vision 
-David worked at Microsoft from 2016-2023
-What did he work on?
-At Microsoft he worked on HoloLens, using feature tracking.
-At Microsoft he experimented with constellation tracking and non-inertial tracking
-David work at startup Tetra in 2023
-At Tetra he worked on ML graph passes, op implementations, and model zoo
-David worked at Qualcomm in 2024
-At Qualcomm he worked on ML graph passes and op implementations 
-
-My data stats: 
-length of dataset in characters: 582
-all the unique characters: 
- ,-.012346?ADHLMNQSTUWabcdefghiklmnoprstuvwxyz
-vocab size: 47
-train has 523 tokens
-val has 59 tokens
-
-
-model 27K params
-Get proper answer from work thing
 
 ## Porting from tflite to C++
 When running the model in NanoGPT's sample.py, there are two parts. One is the actual forward pass of the transformer, which produces a vector of logits, and the other is a loop that runs softmax over these logits, finds the probability of each vocab entry (token), samples from a distribution to get the next token, and then runs the next forward pass over the new token set. 
@@ -186,4 +149,40 @@ Is it actually that simple? Well, let's see if this runs at all. While for my fi
 <results, speed>
 10 tokens per second!! For a basic implementation, that's a lot more than I was expecting
 
+
+So, what do we do from here? Is this it? It runs, produces sentences, yay done move on?\
+Absolutely not! Now we need to see just how fast we can get this model running. The main metric I'll use is tokens per second on prompt processing and decode processing, but as decode is a fixed 31-length sliding window, it doesn't make much of a difference. 
+
+There are a number of optimisations I have in mind: multithreading, unrolling, removing intermediates, RAM residency, quantisation. The next section will go through everything I tried, including failures. 
+
+## Optimisations
+
+TODO get most of this from the chat history at work
+
+### Cache-coherent matmul
+Both attention and Feed-Forward Networks rely on matrix multiplication. My thought was that to optimise for cache-coherency, as matrices tend to be stored linearly, we could write out one row of output at a time - keeping the whole row in cache - and therefore keep one row of matrix $A$ in $C = A\times B$ resident in cache as well, whilst iterating through the columns of B. That second iteration would have cache misses, but no more so than a regular iteration keeping one column of B, iterating through rows of A and rows of output. 
+
+A nice idea in theory; it turns out, from the [datasheet](https://support.arm.com/documentation/100230/latest/) that the ARM Cortex M33, that the RP2350 is based on, has no CPU cache, and therefore ... this is irrelevant. Oh well. A nice idea.
+ 
+
+### SRAM Residency
+
+
+### Unrolling
+
+### Removing Intermediates/Fusing
+
+### KV Cache
+
+### Ignoring unused output
+
+### Multithreading
+
+### Quantisation
+
+## Circuit design and fabrication
+
+I used PCBWay for this
+
+## Conclusion
 
