@@ -119,13 +119,84 @@ Looking at this tflite in netron, we can break the neural network down into its 
 - the [layernorm]() op. Straightforward elementwise mathematical operation. (TFLite does not natively have a Layernorm op, and so breaks this out into constituent operations)
 
 
+```
+for (int i = 0; i < SEQ_LEN; ++i) {
+    // Compute mean
+    float mean = 0.0f;
+    for (int d = 0; d < DIM; ++d) {
+        mean += input[i][d];
+    }
+    mean /= DIM;
+
+    // Compute variance
+    float var = 0.0f;
+    for (int d = 0; d < DIM; ++d) {
+        float val = input[i][d];
+        float diff = val - mean;
+        var += diff * diff;
+    }
+    var /= (float)DIM;
+
+    float inv_std = 1.0f / sqrtf(var + LN_EPS);
+    // Normalize
+    for (int d = 0; d < DIM; ++d) {
+        float val = input[i][d];
+        float norm = (val - mean) * inv_std; /* gamma=1, beta=0 */
+        output[i][d] = norm;
+    }
+}
+```
+
+
 ### Q/K/V
 - Q/K/V matrix multiplications with the embedding vectors. Matrix $\times$ vector, simple
+
+```
+
+```
 
 ### Scaled Self-Attention
 - Scaled self-attention
 [image]
-We'll come back to this
+
+```
+for (int i = 0; i < SEQ_LEN; ++i) {
+    // Compute scores against all keys
+    float scores[SEQ_LEN];
+    float max_score = -INFINITY;
+    for (int j = 0; j < SEQ_LEN; ++j) {
+        float dot = 0.0f;
+        for (int d = 0; d < DIM; ++d) {
+            float q_f = Q[i][d];
+            float k_f = K[j][d];
+            dot += q_f * k_f;
+        }
+        dot *= scale;
+        scores[j] = dot;
+        if (dot > max_score) max_score = dot;
+    }
+
+    // Subtract max for numerical stability and do softmax
+    float exp_scores[SEQ_LEN];
+    float sum_exp = 0.0f;
+    for (int j = 0; j < SEQ_LEN; ++j) {
+        float e = expf(scores[j] - max_score);
+        exp_scores[j] = e;
+        sum_exp += e;
+    }
+
+    // Compute weighted sum of V
+    for (int d = 0; d < DIM; ++d) {
+        float acc = 0.0f;
+        for (int j = 0; j < SEQ_LEN; ++j) {
+            float weight = exp_scores[j] / sum_exp;
+            float v_f = V[j][d];
+            acc += weight * v_f;
+        }
+        context[i][d] = acc;
+    }
+}
+```
 
 
 ### Feed-Forward Network
@@ -142,7 +213,34 @@ This is simply indexing into an array. "Here's some indices for vocab elements, 
 ### Putting it all together
 Now all we need to do is connect those parts ... 
 
-<code>
+```
+compute_qkv(input, weight_qkv, Q, K, V);
+
+/* Step 2: Scaled dot‑product attention. */
+q8_t context[SEQ_LEN][DIM];
+compute_attention(Q, K, V, context);
+
+/* Step 3: Residual add.  Add context back to input. */
+q8_t resid1[SEQ_LEN][DIM];
+add_residual(input, context, resid1);
+
+/* Step 4: LayerNorm. */
+q8_t ln1[SEQ_LEN][DIM];
+apply_layernorm(resid1, ln1);
+
+/* Step 5: Feed‑forward network. */
+q8_t hidden[SEQ_LEN][HIDDEN_DIM];
+fully_connected(ln1, weight_fc1, hidden);
+relu_inplace(hidden);
+q8_t mlp_out[SEQ_LEN][DIM];
+fully_connected2(hidden, weight_fc2, mlp_out);
+
+/* Step 6: Second residual add. */
+q8_t resid2[SEQ_LEN][DIM];
+add_residual(mlp_out, ln1, resid2);
+
+/* Step 7: Optional LayerNorm. 
+```
 
 and thats the whole model! 
 
@@ -150,7 +248,7 @@ and thats the whole model!
 
 Is it actually that simple? Well, let's see if this runs at all. While for my first ML-on-business-card I used the [RP2040](), this does software emulation of floating point hardware - that is, floating point math is actually done with 32-bit integers emulating what a dedicated floating point logic gate circuit would do. This will work, but be slow. Coincidentally, the next generation, the [RP2350]() chip had just come out, and this came with a FPU coprocessor - floating point hardware! So floating point arithmetic could be performed in a single clock cycle. A dev board was acquired, a compiler was run (and run and run and run and eventually the code compiled), a chip was flashed, aaaaaand ...
 
-<results, speed>
+<results, speed> - get this from chat running it
 10 tokens per second!! For a basic implementation, that's a lot more than I was expecting
 
 
@@ -165,7 +263,6 @@ There are several benchmarks I'm using here. For some things like matrix multipl
 
 All optimisations were also checked for accuracy, both on numerical benchmarks (computing matrices etc) and also checking token-generation output. Logits changed slightly, but never enough to change probabilities. Only optimisations that maintain this accuracy are considered. 
 
-TODO get most of this from the chat history at work
 
 ### Cache-coherent matmul
 Both attention and Feed-Forward Networks rely on matrix multiplication. My thought was that to optimise for cache-coherency, as matrices tend to be stored linearly, we could write out one row of output at a time - keeping the whole row in cache - and therefore keep one row of matrix $A$ in $C = A\times B$ resident in cache as well, whilst iterating through the columns of B. That second iteration would have cache misses, but no more so than a regular iteration keeping one column of B, iterating through rows of A and rows of output. 
@@ -201,15 +298,15 @@ for (B matrix rows)
     for (4 A matrix cols)
         for (4 C matrix positions)
             C[i_1,j_1] += a_1*b_1
-            C[i_1,j_1] += a_1*b_1
-            C[i_1,j_1] += a_1*b_1
-            C[i_1,j_1] += a_1*b_1
+            C[i_2,j_2] += a_2*b_2
+            C[i_3,j_3] += a_3*b_3
+            C[i_4,j_4] += a_4*b_4
 ```
 
 We've essentially batched this matmul, doing 4 at a time. Obviously this requires the size to be divisible by 4, but we know the size a priori so we can make this work. Now we do 4 multiplications and 4 additions per loop overhead! The multiplications in the Floating Point coprocessor take a couple of cycles, but there are multiple floating-point registers we can use so these multiplies can be pipelined so we hide the delay on those registers behind the next multiply:
 
 ```
-Example pipeline of 2
+Example with unrolling 2 at a time
 
 Before:
 cycle 1: R0 = R1*R2
@@ -225,7 +322,7 @@ cycle 4: R8 += R5
 cycle 5: loop stuff
 ```
 
-In this 'after', there's no cycle where we are just waiting - we're always doing something. This may seem small, but recall it's the inner loop of three nested loops so this happens a lot. And that's just one matmul, of three matmuls per layer, for two layers, per token. The time difference should add up. 
+In this 'after', there's no cycle where we are just waiting - we're always doing something. This may seem small, but recall it's the inner loop of three nested loops so this happens a lot. And that's just one matmul, of three matmuls per layer, for two layers, per token. The time saving should add up. 
 
 Does it? Let's take a look at the results:
 
@@ -312,7 +409,7 @@ Simple: don't softmax the whole vector, just the last entry, and then only compu
 Let's check the speedup we get:
 
 
-Saves a few hundred milliseconds over the 100 token generation. Not terrible, not great - much like reading 3.6 roentgens. But it causes no harm, and it is objectively faster, so we'll keep it. 
+Saves a few hundred milliseconds over the 100 token generation. Not terrible, not great - much like reading 3.6 roentgens on a dosimeter. But it causes no harm, and it is objectively faster, so we'll keep it. 
 
 ### Multithreading
 Another seemingly obvious win. Until now, all algorithms have run on a single core - which we needed to clearly know what the speedup was, so this one has to come last. 
@@ -322,19 +419,26 @@ The Cortex M33 has two cores, each with a floating point coprocessor. There are 
 How should we split up the matrix multiplication? GELU loop is easy - first half to one core, second half to other core. Matrices, though - the cores need to share one matrix entirely. \
 The way that sounds best on paper is, for $C = A\times B$, to split $A$ between the two cores, share $B$, and then also split the output $C$. The split would occur vertically through the matrix:
 
-```
 
-do this in latex
+$$
+C = AB =
+\left[\begin{array}{c}
+A_1 \\ \hline A_2
+\end{array}\right] B
+=
+\left[\begin{array}{c}
+A_1 B \\ \hline A_2 B
+\end{array}\right]
+=
+\left[\begin{array}{c}
+C_1 \\ \hline C_2
+\end{array}\right]
+$$
 
-```
+where $A_1, A_2 \in \mathbb{R}^{(m/2) \times k}$ and $C_1, C_2 \in \mathbb{R}^{(m/2) \times n}$. Thread $i$ computes $C_i = A_i B$.
 
-Because matrices are laid out linearly, row-major, this means that we give one linear array to each core:
 
-```
-A = [a_00 .... a0n a10 ... a1n ... a_m/20...am/2n] 
-```
-
-simple split, and we don't have to stress about cache coherency because no caches. The output matrix C is split similarly. \
+This works because $A$ is laid out row by row in memory, so by given the first half of the rows to one core, we give it a contiguous memory block, and the second half of the rows is also one contiguous memory block going to the second core. There's no memory contention or overlap. $C$ is laid out the same way.\
 There's some nuance I'm brushing over here with setting up the second core to run, passing jobs to it, etc, but we don't need to go into that. The code is simple enough, and the point here is the theory of splitting and multithreading.
 
 Let's take a look at the results:
@@ -366,10 +470,10 @@ I'm using the same basic concept for the board as with my previous [card](https:
 
 I used [PCBWay](www.pcbway.com) for fabrication. I've talked about [using them before](), and choose them each time. It's such an easy interface and experience:
 
-<picture>
+![](https://dmckinnon.github.io/assets/nfcpre/pcbway.png)
 
 - to get a quote, just put in board dimensions and other details like colour, and approximate price is ready for you
-- to get the board itself, upload your files as a zip, there might be some clarification but they'll help you through issues
+- to get the board itself, [export and uploading all necessary files from KiCad](https://www.pcbway.com/blog/PCB_Design_Tutorial/How_to_Export_Gerber_and_Production_Files_in_KiCad.html) - there might be some clarification but they'll help you through issues
 - board is at your door not long after. They even have the option of doing all the components for you (i still do this myself, but it's just a preference)
 
 Here's the finished board! 
