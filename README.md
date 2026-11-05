@@ -117,22 +117,184 @@ The point of this operation is to normalise the data after each other operation,
 code for it
 ```
 
+```
+for (size_t seq = 0; seq < seq_len; seq++) {
+    const float* input_row = input + seq * embed_dim;
+    float* output_row = output + seq * embed_dim;
+    
+    // Compute mean
+    float mean = 0.0f;
+    for (size_t i = 0; i < embed_dim; i++) {
+        mean += input_row[i];
+    }
+    mean /= embed_dim;
+    
+    // Compute variance
+    float variance = 0.0f;
+    for (size_t i = 0; i < embed_dim; i++) {
+        float diff = input_row[i] - mean;
+        variance += diff * diff;
+    }
+    variance /= embed_dim;
+    
+    // Normalise
+    float inv_std = 1.0f / sqrtf(variance + epsilon);
+    for (size_t i = 0; i < embed_dim; i++) {
+        output_row[i] = gamma[i] * (input_row[i] - mean) * inv_std + beta[i];
+    }
+}
+```
+
+
 ### Q/K/V
-- Q/K/V matrix multiplications with the embedding vectors. Matrix $\times$ vector, simple
+- Q/K/V matrix multiplications with the embedding vectors. Matrix $\times$ vector, simple. By keeping the vectors consecutive in memory, we create a matrix, and can just use our matrix multiplication function to do this:
+
+```
+static inline void matmul(
+    const float* A, size_t rows_a, size_t cols_a,
+    const float* B, size_t cols_b,
+    float* C
+) {
+    for (size_t i = 0; i < rows_a; i++) {
+        for (size_t j = 0; j < cols_b; j++) {
+            float sum = 0.0f;
+            for (size_t k = 0; k < cols_a; k++) {
+                sum += A[i * cols_a + k] * B[k * cols_b + j];
+            }
+            C[i * cols_b + j] = sum;
+        }
+    }
+}
+
+// Then to actually do the QKV projection:
+
+const float* q_weights = qkv_weights;                           // [0:embed_dim, :]
+const float* k_weights = qkv_weights + embed_dim * embed_dim;   // [embed_dim:2*embed_dim, :]
+const float* v_weights = qkv_weights + 2 * embed_dim * embed_dim; // [2*embed_dim:3*embed_dim, :]
+
+// Project to Query
+matmul(input, seq_len, embed_dim, q_weights, embed_dim, query);
+
+// Project to Key
+matmul(input, seq_len, embed_dim, k_weights, embed_dim, key);
+
+// Project to Value
+matmul(input, seq_len, embed_dim, v_weights, embed_dim, value);
+```
 
 ### Scaled Self-Attention
 - Scaled self-attention\
 [image]
 This is the key attention equation:\
 $Attention(Q, K, V) = softmax(\frac{QK^T}{\sqrt{d_k}})V$\
-We could break this down further into a matrix multiplication, a scaling, and another matrix multiplication, but I think it's better to keep it all as one function because then we can smoosh a bunch of things together. This will make more sense later 
+We could break this down further into a matrix multiplication, a scaling, and another matrix multiplication, but I think it's better to keep it all as one function because then we can smoosh a bunch of things together. 
+
+```
+static inline void softmax(float* input, float* output, size_t length) {
+    // Find maximum value for numerical stability
+    float max_val = input[0];
+    for (size_t i = 1; i < length; i++) {
+        if (input[i] > max_val) {
+            max_val = input[i];
+        }
+    }
+    
+    // Compute exponentials and sum
+    float sum = 0.0f;
+    for (size_t i = 0; i < length; i++) {
+        output[i] = expf(input[i] - max_val);
+        sum += output[i];
+    }
+    
+    // Normalize
+    for (size_t i = 0; i < length; i++) {
+        output[i] /= sum;
+    }
+}
+
+// then to perform attention
+
+const float scale = INV_SQRT_HEAD_DIM; // 1/sqrt(embed_dim)
+    
+// Compute Q * K^T / root(embed_dim)
+// query: [seq_len, embed_dim], key^T: [embed_dim, seq_len] -> scores: [seq_len, seq_len]
+for (size_t i = 0; i < seq_len; i++) {
+    for (size_t j = 0; j < seq_len; j++) {
+        float sum = 0.0f;
+        for (size_t k = 0; k < embed_dim; k++) {
+            sum += query[i * embed_dim + k] * key[j * embed_dim + k];
+        }
+        attention_scores[i * seq_len + j] = sum * scale;
+    }
+}
+
+// Apply causal mask and softmax for each query position
+for (size_t i = 0; i < seq_len; i++) {
+    float* score_row = attention_scores + i * seq_len;
+    
+    // Apply causal mask (can only attend to previous and current positions)
+    for (size_t j = i + 1; j < seq_len; j++) {
+        score_row[j] = -INFINITY;
+    }
+    
+    // Apply softmax to this row
+    softmax_inplace(score_row, seq_len);
+}
+
+// Apply attention weights to values: output = attention_scores * value
+// attention_scores: [seq_len, seq_len], value: [seq_len, embed_dim] -> output: [seq_len, embed_dim]
+for (size_t i = 0; i < seq_len; i++) {
+    for (size_t j = 0; j < embed_dim; j++) {
+        float sum = 0.0f;
+        for (size_t k = 0; k < seq_len; k++) {
+            sum += attention_scores[i * seq_len + k] * value[k * embed_dim + j];
+        }
+        output[i * embed_dim + j] = sum;
+    }
+}
+
+```
 
 
 ### Feed-Forward Network
-- Feed Forward Network [image]. This is just a matrix multiplication (`Fully Connected`), a [GELU](https://docs.pytorch.org/docs/2.15/generated/torch.nn.GELU.html) elementwise operation, and then another matrix multiplication. A lot of matrix multiplication happening all up, so an obvious point to start working on.
+- Feed Forward Network [image]. This is just a matrix multiplication (`Fully Connected`), a [GELU](https://docs.pytorch.org/docs/2.15/generated/torch.nn.GELU.html) elementwise operation, and then another matrix multiplication. A lot of matrix multiplication happening all up, so an obvious point to start improvements.
+
+```
+matmul(input, seq_len, embed_dim, up_weights, ffn_dim, hidden);
+    
+// Apply GELU activation in-place
+apply_gelu(hidden, seq_len * ffn_dim);
+
+// Second linear layer: output = hidden * down_weights  
+// hidden: [seq_len, ffn_dim], down_weights: [ffn_dim, embed_dim] -> output: [seq_len, embed_dim]
+matmul(hidden, seq_len, ffn_dim, down_weights, embed_dim, output);
+```
 
 ### Residual Skip Connection
 This is the `Add` operation joining those two branches together. We take the input to the whole layer, before any attention or feed-forward, and add it with the output of the whole layer.
+
+```
+static inline void add_tensors(
+    const float* A,
+    const float* B,
+    float* C,
+    size_t length
+) {
+    // Yeah this one's pretty simple
+    // The vectors are so short it's practically not worth optimising
+    for (size_t i = 0; i < length; i++) {
+        C[i] = A[i] + B[i];
+    }
+}
+
+
+// This comes in after FFN, for example
+float* ffn_output = ffn_op(arena, normalized_input, up_weights, down_weights, 
+                              seq_len, embed_dim, ffn_dim);
+size_t total_elements = seq_len * embed_dim;
+add_tensors(input, ffn_output, output, total_elements);
+    
+```
 
 ### Gather
 This is simply indexing into an array. "Here's some indices for vocab elements, get the vocab elements they refer to".
@@ -141,7 +303,45 @@ This is simply indexing into an array. "Here's some indices for vocab elements, 
 ### Putting it all together
 Now all we need to do is connect those parts ... 
 
-<code>
+```
+// inside Attention with residual:
+qkv_projection(input, qkv_weights, query, key, value, seq_len, embed_dim);
+    
+// Step 2: Scaled Dot-Product Attention
+scaled_dot_product_attention(query, key, value, attention_output, 
+                            attention_scores, seq_len, embed_dim);
+
+// Step 3: Output Projection
+attention_output_projection(attention_output, output_weights, final_output, 
+                               seq_len, embed_dim);
+
+// Step 4: residual
+size_t total_elements = seq_len * embed_dim;
+add_tensors(input, attention_output, output, total_elements);
+
+
+// inside FFN with residual:
+layer_norm(input, normalized_input, ln_gamma, ln_beta, seq_len, embed_dim, LAYER_NORM_EPS);
+float* ffn_output = ffn_op(arena, normalized_input, up_weights, down_weights, 
+                              seq_len, embed_dim, ffn_dim);
+size_t total_elements = seq_len * embed_dim;
+    add_tensors(input, ffn_output, output, total_elements);
+
+
+// Running one full layer:
+// (repeat for n layers, and update parameters accordingly)
+float* attn_output = attention_with_residual(
+    arena, input, attn_qkv, attn_out, ln_gamma_1, ln_beta_1,
+    seq_len, config->embed_dim
+);
+
+// FFN with residual connection
+float* layer_output = ffn_with_residual(
+    arena, attn_output, ffn_up, ffn_down, ln_gamma_2, ln_beta_2,
+    seq_len, config->embed_dim, config->ffn_dim
+);
+
+```
 
 and thats the whole model! 
 
@@ -149,7 +349,7 @@ and thats the whole model!
 
 Is it actually that simple? Well, let's see if this runs at all. While for my first ML-on-business-card I used the [RP2040](), this does software emulation of floating point hardware - that is, floating point math is actually done with 32-bit integers emulating what a dedicated floating point logic gate circuit would do. This will work, but be slow. Coincidentally, the next generation, the [RP2350]() chip had just come out, and this came with a FPU coprocessor - floating point hardware! So floating point arithmetic could be performed in a single clock cycle. A dev board was acquired, a compiler was run (and run and run and run and eventually the code compiled), a chip was flashed, aaaaaand ...
 
-<results, speed>
+<results, speed> - get this from chat running it
 10 tokens per second!! For a basic implementation, that's a lot more than I was expecting
 
 
@@ -164,7 +364,6 @@ There are several benchmarks I'm using here. For some things like matrix multipl
 
 All optimisations were also checked for accuracy, both on numerical benchmarks (computing matrices etc) and also checking token-generation output. Logits changed slightly, but never enough to change probabilities. Only optimisations that maintain this accuracy are considered. 
 
-TODO get most of this from the chat history at work
 
 ### Cache-coherent matmul
 Both attention and Feed-Forward Networks rely on matrix multiplication. My thought was that to optimise for cache-coherency, as matrices tend to be stored linearly, we could write out one row of output at a time - keeping the whole row in cache - and therefore keep one row of matrix $A$ in $C = A\times B$ resident in cache as well, whilst iterating through the columns of B. That second iteration would have cache misses, but no more so than a regular iteration keeping one column of B, iterating through rows of A and rows of output. 
@@ -200,15 +399,15 @@ for (B matrix rows)
     for (4 A matrix cols)
         for (4 C matrix positions)
             C[i_1,j_1] += a_1*b_1
-            C[i_1,j_1] += a_1*b_1
-            C[i_1,j_1] += a_1*b_1
-            C[i_1,j_1] += a_1*b_1
+            C[i_2,j_2] += a_2*b_2
+            C[i_3,j_3] += a_3*b_3
+            C[i_4,j_4] += a_4*b_4
 ```
 
 We've essentially batched this matmul, doing 4 at a time. Obviously this requires the size to be divisible by 4, but we know the size a priori so we can make this work. Now we do 4 multiplications and 4 additions per loop overhead! The multiplications in the Floating Point coprocessor take a couple of cycles, but there are multiple floating-point registers we can use so these multiplies can be pipelined so we hide the delay on those registers behind the next multiply:
 
 ```
-Example pipeline of 2
+Example with unrolling 2 at a time
 
 Before:
 cycle 1: R0 = R1*R2
@@ -224,7 +423,7 @@ cycle 4: R8 += R5
 cycle 5: loop stuff
 ```
 
-In this 'after', there's no cycle where we are just waiting - we're always doing something. This may seem small, but recall it's the inner loop of three nested loops so this happens a lot. And that's just one matmul, of three matmuls per layer, for two layers, per token. The time difference should add up. 
+In this 'after', there's no cycle where we are just waiting - we're always doing something. This may seem small, but recall it's the inner loop of three nested loops so this happens a lot. And that's just one matmul, of three matmuls per layer, for two layers, per token. The time saving should add up. 
 
 Does it? Let's take a look at the results:
 
@@ -311,7 +510,7 @@ Simple: don't softmax the whole vector, just the last entry, and then only compu
 Let's check the speedup we get:
 
 
-Saves a few hundred milliseconds over the 100 token generation. Not terrible, not great - much like reading 3.6 roentgens. But it causes no harm, and it is objectively faster, so we'll keep it. 
+Saves a few hundred milliseconds over the 100 token generation. Not terrible, not great - much like reading 3.6 roentgens on a dosimeter. But it causes no harm, and it is objectively faster, so we'll keep it. 
 
 ### Multithreading
 Another seemingly obvious win. Until now, all algorithms have run on a single core - which we needed to clearly know what the speedup was, so this one has to come last. 
@@ -321,19 +520,26 @@ The Cortex M33 has two cores, each with a floating point coprocessor. There are 
 How should we split up the matrix multiplication? GELU loop is easy - first half to one core, second half to other core. Matrices, though - the cores need to share one matrix entirely. \
 The way that sounds best on paper is, for $C = A\times B$, to split $A$ between the two cores, share $B$, and then also split the output $C$. The split would occur vertically through the matrix:
 
-```
 
-do this in latex
+$$
+C = AB =
+\left[\begin{array}{c}
+A_1 \\ \hline A_2
+\end{array}\right] B
+=
+\left[\begin{array}{c}
+A_1 B \\ \hline A_2 B
+\end{array}\right]
+=
+\left[\begin{array}{c}
+C_1 \\ \hline C_2
+\end{array}\right]
+$$
 
-```
+where $A_1, A_2 \in \mathbb{R}^{(m/2) \times k}$ and $C_1, C_2 \in \mathbb{R}^{(m/2) \times n}$. Thread $i$ computes $C_i = A_i B$.
 
-Because matrices are laid out linearly, row-major, this means that we give one linear array to each core:
 
-```
-A = [a_00 .... a0n a10 ... a1n ... a_m/20...am/2n] 
-```
-
-simple split, and we don't have to stress about cache coherency because no caches. The output matrix C is split similarly. \
+This works because $A$ is laid out row by row in memory, so by given the first half of the rows to one core, we give it a contiguous memory block, and the second half of the rows is also one contiguous memory block going to the second core. There's no memory contention or overlap. $C$ is laid out the same way.\
 There's some nuance I'm brushing over here with setting up the second core to run, passing jobs to it, etc, but we don't need to go into that. The code is simple enough, and the point here is the theory of splitting and multithreading.
 
 Let's take a look at the results:
@@ -365,10 +571,10 @@ I'm using the same basic concept for the board as with my previous [card](https:
 
 I used [PCBWay](www.pcbway.com) for fabrication. I've talked about [using them before](), and choose them each time. It's such an easy interface and experience:
 
-<picture>
+![](https://dmckinnon.github.io/assets/nfcpre/pcbway.png)
 
 - to get a quote, just put in board dimensions and other details like colour, and approximate price is ready for you
-- to get the board itself, upload your files as a zip, there might be some clarification but they'll help you through issues
+- to get the board itself, [export and uploading all necessary files from KiCad](https://www.pcbway.com/blog/PCB_Design_Tutorial/How_to_Export_Gerber_and_Production_Files_in_KiCad.html) - there might be some clarification but they'll help you through issues
 - board is at your door not long after. They even have the option of doing all the components for you (i still do this myself, but it's just a preference)
 
 Here's the finished board! 
