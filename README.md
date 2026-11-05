@@ -1,18 +1,17 @@
 # PicoGPT
-To learn deeply about LLMs I went to none other than [Karpathy](), his [youtube series]() on basic LLM architecture, and of course, his [NanoGPT repository](https://github.com/karpathy/nanogpt). This is an excellent way to learn as Karpathy is clear, goes through simple steps, and the repository provides an easy playground to mess with parameters and model structure - one can see which changes affect and how, like different numbers of attention heads, layers, context length, etc. My own writeups, mostly for my understanding, can be found [elsewhere](https://dmckinnon.github.io/LLMs-overview/) on my [site](https://dmckinnon.github.io/Tokenisation-in-LLMs/). The rest of this writeup assumes a considerable familiarity with Language Model architecture, like Attention Heads, embedding vectors, tokens, etc.
+To learn deeply about LLMs I went to none other than [Karpathy](https://karpathy.ai/), his [youtube series](https://www.youtube.com/playlist?list=PLAqhIrjkxbuWI23v9cThsA9GvCAUhRvKZ) on basic LLM architecture, and of course, his [NanoGPT repository](https://github.com/karpathy/nanogpt). This is an excellent way to learn as Karpathy is clear, goes through simple steps, and the repository provides an easy playground to mess with parameters and model structure - one can see which changes affect and how, like different numbers of attention heads, layers, context length, etc. My own writeups, mostly for my understanding, can be found [elsewhere](https://dmckinnon.github.io/LLMs-overview/) on my [site](https://dmckinnon.github.io/Tokenisation-in-LLMs/). The rest of this writeup assumes a considerable familiarity with Language Model architecture, like Attention Heads, embedding vectors, tokens, etc.
 
 I'd also recently finished my [Machine Learning Business Card](https://dmckinnon.github.io/ML-Business-card/), and was struck by the thought: _could I make a NanoGPT model that ran on one of these cards?_
 
 There's so many considerations involved in this:
 - what does such a model even do? Is it too small to do anything?
 - can you get a meaningful model that small? The voice recognition card has 4MB flash and ~200Kb RAM
-- The base shakespeare-predictor model that NanoGPT creates, completing phrases from the works of Shakespeare based on character-tokens in a prompt, is <todo> mb in size, with X parameters. 
+- The base shakespeare-predictor model that NanoGPT creates, completing phrases from the works of Shakespeare based on character-tokens in a prompt, is ~40~Mb in size, with ~10 million parameters. 
 - how fast will this run? My lil chip runs at 125MHz. The NanoGPT example runs on my laptop in functionally-immediate speed, but my laptop has a discrete GPU.
 
 So, where to start? 
 
 ## Contents
-- [Build and serial usage](#build-and-serial-usage)
 - [Model structure, size, and training](#model-structure-size-and-training)
 - [Porting from tflite to C++](#porting-from-tflite-to-c)
 - [Can this run at all](#can-this-run-at-all)
@@ -37,8 +36,6 @@ If we just run the prompts Karpathy has given us, to predict Shakespeare, then w
 - 384 embedding dimensions
 - ~ 10 million parameters
 - ~40Mb in storage as float
-
-This results in a model of size Y
 
 ### My model
 The training data is the following:
@@ -65,7 +62,7 @@ dataset stats:
 Couple notes:
 - Why the questions? So that this could be legitimately queried, like a prompt could be those precise questions
 - This is succinct because the model is 100kb at most, like I really have to squish it down
-- Could we have more? Not sure, let's start here. Worst case is we overfit to this, and if this happens, I'll train on a bigger dataset
+- Could we have more? Not sure, let's start here. I wasn't sure at the time how good a 100Kb model would be. Worst case is we overfit to this, and if this happens, I'll train on a bigger dataset
 
 I played around with parameters. How many heads? How many embedding dimensions? How many layers? There are so many experiments to run, and I definitely did not exhaustively find the best set of parameters. But that's not my goal - I just want _something that works_. I found that the following worked:
 
@@ -77,7 +74,7 @@ I played around with parameters. How many heads? How many embedding dimensions? 
 - 107Kb in storage as float
 
 By "worked" here I mean:
-- it produced reasonable predictions when prompted. Sentences like "<todo>"
+- it produced reasonable predictions when prompted ... although to be honest, it's so overfit it's just regurgitating the training data
 - it "fits" within the memory budget I have: 100Kb (ok it's 107Kb but this is close enough, I'm going to work with it)
 
 This is a good start! Maybe I want to return to this step for a better model, but this easily fits within the flash we have - 4Mb, the matrices for individual steps fit within the RAM budget, and the results look good. So before I stress too much over getting the perfect model, let's attempt implementation. 
@@ -94,49 +91,51 @@ traced = torch.jit.trace(model, x)
 torch.jit.save(traced, "traced_model.pt")
 ```
 
-This produces a pytorch file we can look at in [Netron](https://netron.app/). 
+This produces a pytorch file. Are we going to manually copy the weights from this? Well, no.\
+Pytorch files are not particularly well optimised, having many redundant layers like transposes that are later cancelled by other transposes, or cast ops to int, or whatever:
 
-[Image]
+[](pytorch.png)
 
-Cool. We going to manually copy the weights from this? Well, no.\
-Pytorch files are not particularly well optimised, having many redundant layers like transposes that are later cancelled by other transposes, or cast ops to int, or wahtever:
+I'd like to clean this model up, and made it easier to understand, for starters. Qualcomm has this marvellous platform called [Qualcomm AI Hub](https://workbench.aihub.qualcomm.com/) that can [optimise a model for a device](https://workbench.aihub.qualcomm.com/docs/hub/compile_examples.html).\
+While the device I'm optimising for isn't available - they only have a selection of Qualcomm chips, funnily enough - this doesn't matter. All I'm really hoping to do is to strip the unnecessary layers from the model. We run it through their platform 
 
-image
+[](tflite1.png)
 
-. Qualcomm has this marvellous platform called [Qualcomm AI Hub](https://aihub.qualcomm.com/) that can optimise a model for a device. (exmaple? Picture)\
-While the device I'm optimising for isn't available - they have a selection of Qualcomm chips, funnily enough - this doesn't matter. All I'm really hoping to do is to strip the unnecessary layers from the model. We run it through their platform
+[](tflite2.png)
 
-image
+[](tflite3.png)
 
-image
+and now we have a tflite file! This is considerably cleaner, so the Qualcomm optimisation pass was worth it, even just for readability. From this we can identify the different parts of the transformer in each layer and consider the code for each part. 
 
-and now we have a tflite file!
-stats, netron, show this is better. 
-
-Looking at this tflite in netron, we can break the neural network down into its parts and consider the code for each part. 
 
 ### Layernorm
-- the [layernorm]() op. Straightforward elementwise mathematical operation. (TFLite does not natively have a Layernorm op, and so breaks this out into constituent operations)
+- the [layernorm](https://docs.pytorch.org/docs/2.15/generated/torch.nn.LayerNorm.html) op. Straightforward elementwise mathematical operation. (TFLite does not natively have a Layernorm op, and so breaks this out into constituent operations). This is\
+$y=\frac{x-\bold{E}[x]}{\sqrt(Var[x]+\epsilon)}\times\gamma +\beta$\
+The point of this operation is to normalise the data after each other operation, so there's a few of these.
 
+```
+code for it
+```
 
 ### Q/K/V
 - Q/K/V matrix multiplications with the embedding vectors. Matrix $\times$ vector, simple
 
 ### Scaled Self-Attention
-- Scaled self-attention
+- Scaled self-attention\
 [image]
-We'll come back to this
+This is the key attention equation:\
+$Attention(Q, K, V) = softmax(\frac{QK^T}{\sqrt{d_k}})V$\
+We could break this down further into a matrix multiplication, a scaling, and another matrix multiplication, but I think it's better to keep it all as one function because then we can smoosh a bunch of things together. This will make more sense later 
 
 
 ### Feed-Forward Network
-- Feed Forward Network [image]. I'll come back to this
+- Feed Forward Network [image]. This is just a matrix multiplication (`Fully Connected`), a [GELU](https://docs.pytorch.org/docs/2.15/generated/torch.nn.GELU.html) elementwise operation, and then another matrix multiplication. A lot of matrix multiplication happening all up, so an obvious point to start working on.
 
 ### Residual Skip Connection
+This is the `Add` operation joining those two branches together. We take the input to the whole layer, before any attention or feed-forward, and add it with the output of the whole layer.
 
 ### Gather
 This is simply indexing into an array. "Here's some indices for vocab elements, get the vocab elements they refer to".
-
-- Residual skip-connection. This is a fancy way of saying "Add the result from this layer to whatever was at the start of the layer". So, vector addition. Easy.
 
 
 ### Putting it all together
