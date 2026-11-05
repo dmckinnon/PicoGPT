@@ -349,8 +349,14 @@ and thats the whole model!
 
 Is it actually that simple? Well, let's see if this runs at all. While for my first ML-on-business-card I used the [RP2040](), this does software emulation of floating point hardware - that is, floating point math is actually done with 32-bit integers emulating what a dedicated floating point logic gate circuit would do. This will work, but be slow. Coincidentally, the next generation, the [RP2350]() chip had just come out, and this came with a FPU coprocessor - floating point hardware! So floating point arithmetic could be performed in a single clock cycle. A dev board was acquired, a compiler was run (and run and run and run and eventually the code compiled), a chip was flashed, aaaaaand ...
 
-<results, speed> - get this from chat running it
-10 tokens per second!! For a basic implementation, that's a lot more than I was expecting
+|Input context length |	Time per next token |	Tokens/second
+|----------------|---------------:|-----------:|
+|5 tokens |	25.473 ms |	39.26
+|7 tokens |	30.128 ms |	33.19
+|10 tokens |	37.315 ms |	26.80
+|31 tokens |	92.209 ms |	10.85
+
+10 tokens per second!! For a basic implementation, that's a lot more than I was expecting. I'm ignoring the low context lengths, because those are not particularly useful. We want full sentences, and when a single token is a single character ... 5 characters doesn't get you much. 31 characters does. 
 
 
 So, what do we do from here? Is this it? It runs, produces sentences, yay done move on?\
@@ -374,9 +380,16 @@ A nice idea in theory; it turns out, from the [datasheet](https://support.arm.co
 ### SRAM Residency
 The RP2350 fetches weights from flash and places them into SRAM to do the matrix calculations. There is a 16 KiB cache for this, buuuuut ... what if we avoided that fetch? Each fetch from flash has a delay due to the cache (could have a miss) and the QSPI memory interface. It's not large, but we have 500Kb of SRAM and a 107Kb model. We can fit this entirely within RAM once upon startup - incurring a one-time cost - but then reuse weights with abandon, processing as many new tokens as we see fit without any extra fetch overhead. 
 
-Here's the code:
+To achieve this, we just use a linker setting: `-DPICO_DEFAULT_BINARY_TYPE=copy_to_ram`\
+Or in CMake, `pico_set_binary_type(PicoGPT copy_to_ram)`. \
+THis then copies all application code and constants, like weights, into SRAM upon boot. We could manually write a copy, but I prefer to not reinvent the wheel (or the memcpy).
 
 Here's the timing, with and without:
+|Configuration	|Time per token, 31-token context|	Tokens/s|
+|----------------|---------------:|-----------:|
+| baseline, flash/XIP|	79.852 ms|	12.52|
+|SRAM code + weights|	63.907 ms|	15.65|
+
 
 A considerable improvement! An expected one, but nonetheless rewarding to see. 
 
@@ -427,30 +440,44 @@ In this 'after', there's no cycle where we are just waiting - we're always doing
 
 Does it? Let's take a look at the results:
 
-<results>
+|Configuration|	Time/token|	Tokens/s|	Speedup vs flash baseline|
+|----------------|---------------:|-----------:|-----------:|
+|Flash/XIP baseline|	79.852 ms	|12.52	|1.00×|
+|SRAM code + weights|	63.907 ms|	15.65|	1.25×|
+|Four-way matmul unrolling: FFN and attention projections|	40.826 ms	|24.49	|1.96×|
 
 As expected, we get gainz. That's enormous though! 
 
 What can be unrolled?\
-Any loop, really. Matrix multiplications, elementwise operations like tensor addition or GELU, parts of the softmax function. Unroll everything!
+Any loop, really. Matrix multiplications, elementwise operations like tensor addition or GELU, parts of the softmax function. Unroll everything! I realised later that I had forgotten some of the loops to unroll here, and so our speedup is technically even more.
 
 
-
-
-### Fused FMA
+### Fused Multiply-Accumulate
 Can we make the inner loop of matmuls even faster? Until now, this inner loop of the matrix multiplication has been using two instructions: floating point multiply, and floating point add. \
-But there's an important feature in this floating point coprocessor: [Fused Multiply-Accumulate](https://pip-assets.raspberrypi.com/categories/1214-rp2350/documents/RP-008373-DS-3-rp2350-datasheet.pdf)! (Section 3.7.2.4)
+But there's an important feature in this floating point coprocessor: [Fused Multiply-Accumulate](https://pip-assets.raspberrypi.com/categories/1214-rp2350/documents/RP-008373-DS-3-rp2350-datasheet.pdf), also known as `FMA` (Section 3.7.2.4).
 
 This does exactly as it sounds, performing a multiply and accumulate (+=) all in one instruction. This should make our inner loop have half the number of instructions! That's twice as fast! It's a relatively simple change, just a compiler flag:
 
-TODO
+```
+# Specifically, the ffp-contract=on is the FMA.
+target_compile_options(PicoGPT PRIVATE
+    -Wall -Wextra -O2 -fstack-usage -ffp-contract=on
+)
+```
 
 And this will replace floating point multiplies followed by accumulates with the single instruction. 
 
-Check results:
+Check results, and note that this is on top of unrolled loops:
+
+|Measurement|	FMA off|	FMA on|	Change in elapsed time|
+|----------------|---------------:|-----------:|-----------:|
+|Scalar attention-projection matmul	|1.836 ms	|1.624 ms	|11.5% less|
+|Four-way attention-projection matmul|	0.945 ms|	1.168 ms|	23.6% more|
+|Four-way FFN-up matmul	|3.767 ms|	4.659 ms	|23.7% more|
+|Generate 100 tokens, inference only	|3.432 s|	3.612 s|	5.2% more|
 
 Oh.\
-This is slower.\
+This is slower, overall.\
 Hmm. \
 Why is this slower?
 
@@ -465,7 +492,7 @@ For example, after FFN we have the residual skip-layer, where we add the tensor 
 Or\
 We could, while performing the matmul, add the residual to the layer-input tensor at the output of the matmul, and thereby avoid a whole separate iteration through the tensor?
 
-let's see this in code:
+Let's see this in code:
 
 ```
 Before:
@@ -490,27 +517,36 @@ We can do this for the two residual skip-connections, and also the GELU operatio
 
 Let's check these separately:
 
-<Skip-connections>
+|FFN configuration|	Full-context time/token	|Tokens/s|	100-token inference|
+|----------------|---------------:|-----------:|-----------:|
+|Before fusion|	40.826 ms	|24.49	|3.432 s|
+|Buffer reuse + fused residual and fused GELU|	41.863 ms	|23.89	|3.517 s|
+|Buffer reuse + fused residual, separate GELU	|40.330 ms	|24.80	|3.388 s|
 
-<GELU>
+So the skip connection fusing works, albeit for a marginal gain. Why doesn't GELU? GELU uses the [C++ `erff` function](https://en.cppreference.com/cpp/numeric/math/erf), which is register heavy. This works on its own, but when we are trying to preserve four separate accumulated values ... that costs extra registers which therefore cannot be used during a register heavy function. I didn't dig into the assembly here, but my best guess is that there was some use of SRAM to hold register values while `erff` was computed, reducing time savings under fused-unrolling.
 
-So the skip connection fusing works well. Why doesn't GELU? <something about the full erff??>
+Oh well. We can still unroll the GELU on its own and get an already-proven win there - that is, finish the unrolled matmul, save an intermediate, perform GELU unrolled on its own loop (so each of four `erff` calls in the loop has full register access), and then move on to the next matmul. How does this perform?
 
-Oh well. We can still unroll the GELU and get an already-proven win there. 
+|Configuration|	Time/token	|Tokens/s	|Speedup vs flash baseline|
+|----------------|---------------:|-----------:|-----------:|
+|Flash/XIP baseline	|79.852 ms|	12.52	|1.00×|
+|SRAM code + weights|	63.907 ms|	15.65	|1.25×|
+|Four-way matmul unrolling: FFN and attention projections|	40.826 ms	|24.49|	1.96×|
+|FFN buffer reuse, fused residual, separate GELU|	40.330 ms	|24.80	|1.98×|
+
+The fused residual is a pretty small gain, but again - doesn't hurt us, doesn't overly complicate the code, so I'm going to keep this in.
 
 
 ### KV Cache
+One common optimisation in the LLM-implementation field is that of a KV cache. When generating tokens after the prompt, since we have already run over the attention of previous tokens to other previous tokens, this does not need to be recomputed, so we, well, cache the result of this and simply compute the K/V results for any new tokens. 
+
+Should we do this here?
+
+I decided against this one. Two reasons:
+- When generating tokens, I use a sliding window context of 31 tokens - therefore, any results older than 31 tokens become irrelevant, and we need to recompute the 31-token attention anyway, or do complex cache management. Recomputing is easier.
+- 31-token context is simply not large enough to warrant the complexity of a KV cache
 
 
-### Ignoring unused output
-In the base implementation, we compute a whole vector of output logits, softmax to get the probabilities per index, and then choose a token per index. But previous indices have already been computed! We only need the last token. 
-
-Simple: don't softmax the whole vector, just the last entry, and then only compute for this token. Removes unneeded compute. 
-
-Let's check the speedup we get:
-
-
-Saves a few hundred milliseconds over the 100 token generation. Not terrible, not great - much like reading 3.6 roentgens on a dosimeter. But it causes no harm, and it is objectively faster, so we'll keep it. 
 
 ### Multithreading
 Another seemingly obvious win. Until now, all algorithms have run on a single core - which we needed to clearly know what the speedup was, so this one has to come last. 
@@ -544,7 +580,30 @@ There's some nuance I'm brushing over here with setting up the second core to ru
 
 Let's take a look at the results:
 
+|Execution	|Full-context time/token|	Tokens/s	|100-token inference|
+|----------------|---------------:|-----------:|-----------:|
+Single core|	37.862 ms|	26.41	|3.195 s|
+Two cores	|24.018 ms	|41.64	|2.024 s|
+
+
 A clear win. We didn't really expect anything else - doing half the work simultaneously with the other half of the work, with minimal overhead.
+
+### Ignoring unused output
+Almost an afterthought, this one. "I thought multithreading was the last optimisation" yes and it is, this is more just "I noticed i was doing computation I didn't need to".\
+In the base implementation, we compute a whole vector of output logits, softmax to get the probabilities per index, and then choose a token per index. But previous indices have already been computed! We only need the last token. 
+
+Simple: don't softmax the whole vector, just the last entry, and then only compute for this token. Removes unneeded compute. 
+
+Let's check the speedup we get:
+|Measurement|	Before	|Last-position-only output|
+|----------------|---------------:|-----------:|
+|Full-context time/token	|24.018 ms|	20.779 ms|
+|Tokens/second	|41.64	|48.13|
+|100-token inference	|2.024 s	|1.749 s|
+
+
+
+Saves a few hundred milliseconds over the 100 token generation. Not terrible, not great - much like reading 3.6 roentgens on a dosimeter. But it causes no harm, and it is objectively faster, so we'll keep it. 
 
 ### Quantisation
 "I thought multithreading was the last optimisation"\
@@ -559,6 +618,7 @@ Large models quantise far more viciously, down to 2 or 1 bit, but they have enou
 So to wrap this up, I was happy with the speed and quality of floating point, and did not see a need. The original motivation for this project was indeed to use the DSP acceleration of int8 arithmetic, but ... now I want to try other things. See the conclusion for more details. 
 
 For now, I'm considering optimisation done.
+
 
 
 ## Circuit design and fabrication
@@ -584,7 +644,7 @@ Here's the finished board!
 It's easy to flash, and I'm realy happy with Raspberry Pi for this one - holding the BOOTSEL button puts it in flashing mode and it appears as a storage device on the computer. Drag and drop the binary, it reboots, and then runs. See below for [Usage](#usage)
 
 ## Conclusion
-I'm really pleased with how this turned out. I never got to the original idea that kicked it off - using the DSP to accelerate a quantised version to reasonable speeds - but this was still fun.\
+I'm really pleased with how this turned out. I never got to the original idea that kicked it off - using the DSP to accelerate a quantised version to reasonable speeds - but this was still fun. This started with 5.4s for generating a hundred tokens, and ended up with 1.7s.\
 The model is definitely smaller than it could be, and considerably overfit, so it comes across as too regurgitative of the training data. But the optimisations drastically speed things up, and that proves a good initial point - I could use a much bigger model, and still get reasonable speed. \
 Other tech workers have seen this demonstrated and were delighted or impressed at the concept and execution, also proving the point that it's a useful exercise and gets the attention of a potential hiring manager. 
 
