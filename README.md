@@ -639,6 +639,8 @@ I used [PCBWay](www.pcbway.com) for fabrication. I've talked about [using them b
 
 Here's the finished board! 
 
+
+TODO add image
 <image>
 
 It's easy to flash, and I'm realy happy with Raspberry Pi for this one - holding the BOOTSEL button puts it in flashing mode and it appears as a storage device on the computer. Drag and drop the binary, it reboots, and then runs. See below for [Usage](#usage)
@@ -652,7 +654,24 @@ Other tech workers have seen this demonstrated and were delighted or impressed a
 As mentioned, the model is small and overfit, and runs far faster than necessary. Given that the chip I used has 2Mb flash, what I'd like to try next is a _much_ bigger model - perhaps a whole megabyte, perhaps even more. I'd practically write my biography, so far more detail and training data, and have it learn that to answer any query deeply. Then there's problems to reckon with like paging the weights in and out of flash with one core while the other core performs matmuls, and we might need to make more serious optimisations, cos there's so much more model to process. It'll run a whole lot slower, but this would be a fun test of just how big I can go and maintain something like, say, 10 tokens per second generation speed. 
 
 ### A note about AI usage
+Generative AI was used in this project. There's an open philosophical discussion about how much that makes this "my" project vs ... well, who do we credit for the AI part? The data it trained on? Anyway, the point here is not to reopen that box ...\
+How was it used?\
+I did some code generation, but crafted the main ideas, and hand-wrote some of the code myself. Let me give some examples:
 
+- "I'd like to try unrolling the matmul loops. Instead of just accumulating one value per loop, let's try four. Can you implement this on each matmul loop and also the loop that performs the GELU?"\
+I see this as my idea and thought process, and just me skipping the mechanical effort of adding in
+```
+C[i_1] += a_1*b_1;
+C[i_2] += a_2*b_2;
+C[i_3] += a_3*b_3;
+```
+multiple times across several files. We all know that's error prone and not fun. The agent may have made an error, but I can review this pretty quick as its a small project.
+
+- I wrote the original multithread code that split the matrices and ran the second half on the second core, for one matmul, and then asked the agent to do the same for the matmul-with-residual impl, and also tidy up the interface. It suggested an improved way; I went with this.
+
+- More abstractly, I asked for a build script, and some pretty-printing of results so I could read them better. I've handwritten a lot of `printf` stuff in the past; I don't want to manually do all that again. 
+
+We can quibble back and forth about how much this makes this "my" project, but I at least wanted to be clear about the workload split. 
 
 ## Usage
 
