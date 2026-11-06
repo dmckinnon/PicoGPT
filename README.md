@@ -1,5 +1,21 @@
 # PicoGPT
-To learn deeply about LLMs I went to none other than [Karpathy](https://karpathy.ai/), his [youtube series](https://www.youtube.com/playlist?list=PLAqhIrjkxbuWI23v9cThsA9GvCAUhRvKZ) on basic LLM architecture, and of course, his [NanoGPT repository](https://github.com/karpathy/nanogpt). This is an excellent way to learn as Karpathy is clear, goes through simple steps, and the repository provides an easy playground to mess with parameters and model structure - one can see which changes affect and how, like different numbers of attention heads, layers, context length, etc. My own writeups, mostly for my understanding, can be found [elsewhere](https://dmckinnon.github.io/LLMs-overview/) on my [site](https://dmckinnon.github.io/Tokenisation-in-LLMs/). The rest of this writeup assumes a considerable familiarity with Language Model architecture, like Attention Heads, embedding vectors, tokens, etc.
+I’ve wanted to learn more about the optimisation techniques that go into running modern LLMs on specialised hardware for a long time, so I recently did a technical deep dive. This involved creating and training a small (few megabytes) GPT-architecture model, which got me thinking: could I optimise such a model to run on something small? What's the smallest thing I could get a reasonable GPT to run on? 
+
+Lo and behold, I give you a Generative Pretrained Transformer running on an ARM Cortex M33, at ~50 tokens per second generation. Let's dive in to how I achieved this.
+
+
+## Contents
+- [Introduction](#introduction)
+- [Model structure, size, and training](#model-structure-size-and-training)
+- [Porting from tflite to C++](#porting-from-tflite-to-c)
+- [Can this run at all](#can-this-run-at-all)
+- [Optimisations](#optimisations)
+- [Circuit design and fabrication](#circuit-design-and-fabrication)
+- [Conclusion](#conclusion)
+- [Usage](#usage)
+
+## Introduction
+To learn deeply about LLMs I went to none other than [Karpathy](https://karpathy.ai/), his [youtube series](https://www.youtube.com/playlist?list=PLAqhIrjkxbuWI23v9cThsA9GvCAUhRvKZ) on basic LLM architecture, and of course, his [NanoGPT repository](https://github.com/karpathy/nanogpt). This is an excellent way to learn as Karpathy is clear, goes through simple steps, and the repository provides an easy playground to mess with parameters and model structure - one can see which changes affect what, like different numbers of attention heads, layers, context length, etc. The rest of this writeup assumes a considerable familiarity with the topics Karpathy goes over, Language Model architecture, Attention Heads, embedding vectors, tokens, etc. (For those who don't like youtube videos, my own writeups, mostly for my understanding, can be found [elsewhere](https://dmckinnon.github.io/LLMs-overview/) on my [site](https://dmckinnon.github.io/Tokenisation-in-LLMs/))
 
 I'd also recently finished my [Machine Learning Business Card](https://dmckinnon.github.io/ML-Business-card/), and was struck by the thought: _could I make a NanoGPT model that ran on one of these cards?_
 
@@ -9,23 +25,19 @@ There's so many considerations involved in this:
 - The base shakespeare-predictor model that NanoGPT creates, completing phrases from the works of Shakespeare based on character-tokens in a prompt, is ~40~Mb in size, with ~10 million parameters. 
 - how fast will this run? My lil chip runs at 125MHz. The NanoGPT example runs on my laptop in functionally-immediate speed, but my laptop has a discrete GPU.
 
+There's two main challenges:
+1. Creating a model that can, at minimum, fit into the flash of this chip (4Mb), and probably needs to be smaller, but that also can generate coherent english sentences.
+2. Getting such a model to run in real time on this tiny chip 
+
 So, where to start? 
 
-## Contents
-- [Model structure, size, and training](#model-structure-size-and-training)
-- [Porting from tflite to C++](#porting-from-tflite-to-c)
-- [Can this run at all](#can-this-run-at-all)
-- [Optimisations](#optimisations)
-- [Circuit design and fabrication](#circuit-design-and-fabrication)
-- [Conclusion](#conclusion)
-- [Usage](#usage)
-
 ## Model structure, size, and training
-First, can we even create a model that's really small and does something useful. I set myself a size budget of 100Kb - as in the model file (all model parameters) could not be larger than this - and twiddled with the base model. But what should we train it on? 100Kb model, predicting Shakespeare? That's boring, that's not much Shakespeare and also who cares. Some other pithy quotes? Amusing, but no. 
+First, can we even create a model that's really small and does something useful? I set myself a size budget of 100Kb - as in the model file (all model parameters) could not be larger than this - and twiddled with the base model. This budget comes from being ~half the RAM of the RP2040 - I'm eyeballing and thinking the code won't take much, and then we need some memory for stack, heap, etc, so 100kb seems like a good amount to aim for a priori.\ 
+But what should we train it on? 100Kb model, predicting Shakespeare? That's boring, that's not much Shakespeare and also who cares. Some other pithy quotes? Amusing, but no. 
 
 What about ... me? What if we trained the model to regurgitate facts about me? Going back to the business card idea, wouldn't it be great if my business card could just ... speak my resume to people and answer queries about that? 
 
-I loved this idea, so I wrote up my CV, writ small, to use as the training set. 
+I loved this idea, so I wrote up my CV, writ small (100Kb model, remember, it's not learning much), to use as the training set. 
 
 ### The base model
 If we just run the prompts Karpathy has given us, to predict Shakespeare, then we get a model with:
@@ -57,10 +69,11 @@ At Qualcomm he worked on ML graph passes and op implementations
 dataset stats:
 - length of dataset in characters: 582
 - all the unique characters:  ,-.012346?ADHLMNQSTUWabcdefghiklmnoprstuvwxyz
-- vocab size: 47 unique tokens
+- vocab size: 47 unique tokens, where each token is a single character
 
 Couple notes:
 - Why the questions? So that this could be legitimately queried, like a prompt could be those precise questions
+- "doesn't this contain a lot of redundancy?". Yes. Yes it does. The tokenizer I'm using tokenises by characters. I want there to be examples where the characters "experimented" follow "he", but also the characters "studied" follow "he", and so on and so forth. 
 - This is succinct because the model is 100kb at most, like I really have to squish it down
 - Could we have more? Not sure, let's start here. I wasn't sure at the time how good a 100Kb model would be. Worst case is we overfit to this, and if this happens, I'll train on a bigger dataset
 
@@ -70,11 +83,11 @@ I played around with parameters. How many heads? How many embedding dimensions? 
 - 2 layers
 - 32 embedding width
 - context length 31, using a sliding window context
-- 27 232 parameters
+- 27,232 parameters
 - 107Kb in storage as float
 
 By "worked" here I mean:
-- it produced reasonable predictions when prompted ... although to be honest, it's so overfit it's just regurgitating the training data
+- it produced reasonable predictions when prompted ... although to be honest, it's so overfit it's just regurgitating the training data. TODO examples
 - it "fits" within the memory budget I have: 100Kb (ok it's 107Kb but this is close enough, I'm going to work with it)
 
 This is a good start! Maybe I want to return to this step for a better model, but this easily fits within the flash we have - 4Mb, the matrices for individual steps fit within the RAM budget, and the results look good. So before I stress too much over getting the perfect model, let's attempt implementation. 
@@ -97,6 +110,7 @@ Pytorch files are not particularly well optimised, having many redundant layers 
 [](pytorch.png)
 
 I'd like to clean this model up, and made it easier to understand, for starters. Qualcomm has this marvellous platform called [Qualcomm AI Hub](https://workbench.aihub.qualcomm.com/) that can [optimise a model for a device](https://workbench.aihub.qualcomm.com/docs/hub/compile_examples.html).\
+(Disclosure: no, I'm not sponsored by Qualcomm. I used to work on this product, however, and just genuinely think it's really useful)\
 While the device I'm optimising for isn't available - they only have a selection of Qualcomm chips, funnily enough - this doesn't matter. All I'm really hoping to do is to strip the unnecessary layers from the model. We run it through their platform 
 
 [](tflite1.png)
@@ -112,10 +126,6 @@ and now we have a tflite file! This is considerably cleaner, so the Qualcomm opt
 - the [layernorm](https://docs.pytorch.org/docs/2.15/generated/torch.nn.LayerNorm.html) op. Straightforward elementwise mathematical operation. (TFLite does not natively have a Layernorm op, and so breaks this out into constituent operations). This is\
 $y=\frac{x-\bold{E}[x]}{\sqrt(Var[x]+\epsilon)}\times\gamma +\beta$\
 The point of this operation is to normalise the data after each other operation, so there's a few of these.
-
-```
-code for it
-```
 
 ```
 for (size_t seq = 0; seq < seq_len; seq++) {
@@ -257,7 +267,7 @@ for (size_t i = 0; i < seq_len; i++) {
 
 
 ### Feed-Forward Network
-- Feed Forward Network [image]. This is just a matrix multiplication (`Fully Connected`), a [GELU](https://docs.pytorch.org/docs/2.15/generated/torch.nn.GELU.html) elementwise operation, and then another matrix multiplication. A lot of matrix multiplication happening all up, so an obvious point to start improvements.
+- Feed Forward Network [image]. This is just a matrix multiplication (`Fully Connected`), a [GELU](https://docs.pytorch.org/docs/2.15/generated/torch.nn.GELU.html) elementwise operation, and then another matrix multiplication. A lot of matrix multiplication happening all over the place, so an obvious point to start improvements.
 
 ```
 matmul(input, seq_len, embed_dim, up_weights, ffn_dim, hidden);
@@ -347,7 +357,7 @@ and thats the whole model!
 
 ## Can this run at all
 
-Is it actually that simple? Well, let's see if this runs at all. While for my first ML-on-business-card I used the [RP2040](), this does software emulation of floating point hardware - that is, floating point math is actually done with 32-bit integers emulating what a dedicated floating point logic gate circuit would do. This will work, but be slow. Coincidentally, the next generation, the [RP2350]() chip had just come out, and this came with a FPU coprocessor - floating point hardware! So floating point arithmetic could be performed in a single clock cycle. A dev board was acquired, a compiler was run (and run and run and run and eventually the code compiled), a chip was flashed, aaaaaand ...
+Is it actually that simple? Well, let's see if this runs at all. For my first ML-on-business-card I used the [RP2040](https://pip-assets.raspberrypi.com/categories/814-rp2040/documents/RP-008371-DS-1-rp2040-datasheet.pdf), but it does software emulation of floating point hardware - that is, floating point math is actually done with 32-bit integers emulating what a dedicated floating point logic gate circuit would do. Software-floating-point will work, but be slow. Coincidentally, the next generation, the [RP2350]() chip had just come out, and this one came with a FPU coprocessor - floating point hardware! So floating point arithmetic could be performed in a single clock cycle. A dev board was acquired, a compiler was run (and run and run and run and eventually the code compiled), a chip was flashed, aaaaaand ...
 
 |Input context length |	Time per next token |	Tokens/second
 |----------------|---------------:|-----------:|
@@ -366,9 +376,15 @@ There are a number of optimisations I have in mind: multithreading, unrolling, r
 
 ## Optimisations
 
-There are several benchmarks I'm using here. For some things like matrix multiplication, we can easily creawte a standalone benchmark. I'm also giving the model a small prompt and generating 100 output tokens based on this prompt, and we'll see how that is affected each time. 
+There are several benchmarks I'm using here. For some things like matrix multiplication, we can easily create a standalone benchmark. I'm also giving the model a small prompt and generating 100 output tokens based on this prompt, and we'll see how that is affected each time. 
 
-All optimisations were also checked for accuracy, both on numerical benchmarks (computing matrices etc) and also checking token-generation output. Logits changed slightly, but never enough to change probabilities. Only optimisations that maintain this accuracy are considered. 
+All optimisations were also checked for accuracy, both on numerical benchmarks (computing matrices etc) and also checking token-generation output. While the output logits (the values directly from the final layer) changed slightly, the difference was never enough to change the final probabilities for each token, for the next prediction. Only optimisations that maintain this accuracy are considered. 
+
+There are a couple of optimisations some notice are missing here; namely, quantisation and KV caches. I did consider these and ultimately rejected, and I'll address that briefly:
+- Quantisation.\
+Quantisation involves squashing my nice and accurate floating points into discrete little int8s. The advantages of this are namely storage - I could have four times as many parameters for the same flash size - and processing speed, as I could use the M33's DSP to do SIMD operations on int8 data, computing 4 results within one clock cycle. However, there's an accuracy cost to quantisation, and given the speeds I ended up getting with floating point, I did not consider the accuracy hit worthwhile at this stage. Perhaps for V2, where I want to attempt a bigger model.
+- KV Cache\
+One common optimisation in the LLM-implementation field is that of a KV cache. When generating tokens after the prompt, since we have already run over the attention of previous tokens to other previous tokens, this does not need to be recomputed, so we, well, cache the result of this and simply compute the K/V results for any new tokens. I decided against this one. Firstly, when generating tokens, I use a sliding window context of 31 tokens - therefore, any results older than 31 tokens become irrelevant, and we need to recompute the 31-token attention anyway, or do complex cache management. Recomputing is easier. Secondly, 31-token context is simply not large enough to warrant the complexity of a KV cache.
 
 
 ### Cache-coherent matmul
@@ -382,7 +398,7 @@ The RP2350 fetches weights from flash and places them into SRAM to do the matrix
 
 To achieve this, we just use a linker setting: `-DPICO_DEFAULT_BINARY_TYPE=copy_to_ram`\
 Or in CMake, `pico_set_binary_type(PicoGPT copy_to_ram)`. \
-THis then copies all application code and constants, like weights, into SRAM upon boot. We could manually write a copy, but I prefer to not reinvent the wheel (or the memcpy).
+This then copies all application code and constants, like weights, into SRAM upon boot. We could manually write a copy, but I prefer to not reinvent the wheel (or the memcpy).
 
 Here's the timing, with and without:
 |Configuration	|Time per token, 31-token context|	Tokens/s|
@@ -537,21 +553,10 @@ Oh well. We can still unroll the GELU on its own and get an already-proven win t
 The fused residual is a pretty small gain, but again - doesn't hurt us, doesn't overly complicate the code, so I'm going to keep this in.
 
 
-### KV Cache
-One common optimisation in the LLM-implementation field is that of a KV cache. When generating tokens after the prompt, since we have already run over the attention of previous tokens to other previous tokens, this does not need to be recomputed, so we, well, cache the result of this and simply compute the K/V results for any new tokens. 
-
-Should we do this here?
-
-I decided against this one. Two reasons:
-- When generating tokens, I use a sliding window context of 31 tokens - therefore, any results older than 31 tokens become irrelevant, and we need to recompute the 31-token attention anyway, or do complex cache management. Recomputing is easier.
-- 31-token context is simply not large enough to warrant the complexity of a KV cache
-
-
-
 ### Multithreading
 Another seemingly obvious win. Until now, all algorithms have run on a single core - which we needed to clearly know what the speedup was, so this one has to come last. 
 
-The Cortex M33 has two cores, each with a floating point coprocessor. There are no CPU caches, as mentioned previously, and both cores just read and write directly to SRAM. All we need to do is split the loops we intend to multi-thread correctly so no memory contention occurs, and this should just fall into place. We'll multithread the matrix multiplication loops - unrolled and with fused intermediates, so this means multithreading several implementations - and try the elementwise GELU loop. The softmax ... is finicky enough and doesn't take enouhg time for this to be worth it. I profiled the whole thing, and matmul dominates. Softmax was a mere 5% of time, to the ~60% of time spent on matmul. 
+The Cortex M33 has two cores, each with a floating point coprocessor. There are no CPU caches, as mentioned previously, and both cores just read and write directly to SRAM. All we need to do is split the loops we intend to multi-thread correctly so no memory contention occurs, and this should just fall into place. We'll multithread the matrix multiplication loops - unrolled and with fused intermediates, so this means multithreading several implementations - and try the elementwise GELU loop. The softmax ... is finicky enough and doesn't take enough time for this to be worth it. I profiled the whole thing, and matmul dominates. Softmax was a mere 5% of time, to the ~60% of time spent on matmul. 
 
 How should we split up the matrix multiplication? GELU loop is easy - first half to one core, second half to other core. Matrices, though - the cores need to share one matrix entirely. \
 The way that sounds best on paper is, for $C = A\times B$, to split $A$ between the two cores, share $B$, and then also split the output $C$. The split would occur vertically through the matrix:
@@ -575,7 +580,7 @@ $$
 where $A_1, A_2 \in \mathbb{R}^{(m/2) \times k}$ and $C_1, C_2 \in \mathbb{R}^{(m/2) \times n}$. Thread $i$ computes $C_i = A_i B$.
 
 
-This works because $A$ is laid out row by row in memory, so by given the first half of the rows to one core, we give it a contiguous memory block, and the second half of the rows is also one contiguous memory block going to the second core. There's no memory contention or overlap. $C$ is laid out the same way.\
+This works because $A$ is laid out row by row in memory, so by giving the first half of the rows to one core, we give it a contiguous memory block, and the second half of the rows is also one contiguous memory block going to the second core. There's no memory contention or overlap. $C$ is laid out the same way.\
 There's some nuance I'm brushing over here with setting up the second core to run, passing jobs to it, etc, but we don't need to go into that. The code is simple enough, and the point here is the theory of splitting and multithreading.
 
 Let's take a look at the results:
@@ -589,8 +594,7 @@ Two cores	|24.018 ms	|41.64	|2.024 s|
 A clear win. We didn't really expect anything else - doing half the work simultaneously with the other half of the work, with minimal overhead.
 
 ### Ignoring unused output
-Almost an afterthought, this one. "I thought multithreading was the last optimisation" yes and it is, this is more just "I noticed i was doing computation I didn't need to".\
-In the base implementation, we compute a whole vector of output logits, softmax to get the probabilities per index, and then choose a token per index. But previous indices have already been computed! We only need the last token. 
+Almost an afterthought, this one. In the base implementation, we compute a whole vector of output logits, softmax to get the probabilities per index, and then choose a token per index. But previous indices have already been computed! We only need the last token. 
 
 Simple: don't softmax the whole vector, just the last entry, and then only compute for this token. Removes unneeded compute. 
 
@@ -605,18 +609,6 @@ Let's check the speedup we get:
 
 Saves a few hundred milliseconds over the 100 token generation. Not terrible, not great - much like reading 3.6 roentgens on a dosimeter. But it causes no harm, and it is objectively faster, so we'll keep it. 
 
-### Quantisation
-"I thought multithreading was the last optimisation"\
-It is. I didn't end up doing quantisation, but it's here because it's a well known one, and a major one to consider. 
-
-Quantisation is where instead of using floating point values for all inputs, outputs, and computation, we get the range of values we expect and squash all values in between into a range of 256 - so 8 bits. Now we are computing on 8 bits, and storing on 8 bits. The model is smaller, we can compute faster (while the FPU does handle arithmetic in a small number of clock cycles, the DSP engine in the Cortex M33 allows us to do arithmetic on 4 separate bytes simultaneously, giving us a speedup of nearly 4 within things like matrix multiplication). 
-
-However, this comes with a significant accuracy hit. How bad?\
-I did not quantify. After I saw the results we get from the above optimisations chained together, I ... didn't feel like quantisation added anything. Yes, I could potentially get another speedup, but this was already more than fast enough and from experience this could take an accuracy hit of up to 30%? Maybe worse?\
-Large models quantise far more viciously, down to 2 or 1 bit, but they have enough parameters to overcome this brutally tight quantisation. I could therefore make a larger model and quantise it harder ... and this is a subject of later discussion.
-
-So to wrap this up, I was happy with the speed and quality of floating point, and did not see a need. The original motivation for this project was indeed to use the DSP acceleration of int8 arithmetic, but ... now I want to try other things. See the conclusion for more details. 
-
 For now, I'm considering optimisation done.
 
 
@@ -629,13 +621,15 @@ I'm using the same basic concept for the board as with my previous [card](https:
 1. This uses the RP2354, not RP2350. What's the difference? The 2354 has 2MB of flash built in, instead of needing an external flash chip. It's not much, and I have spare flash chips sitting around, but it makes circuit design and routing just that little bit simpler
 2. I'm breaking out all the rest of the chip's GPIO. The intention here is that this board is reusable as a Raspberry Pi Pico 2 dev board, just a nice touch to whoever you give this away to, OR if I just happen to need another dev board and my main one is tied up in another project. Reusability is nice. 
 
-I used [PCBWay](www.pcbway.com) for fabrication. I've talked about [using them before](), and choose them each time. It's such an easy interface and experience:
+I used [PCBWay](https://www.pcbway.com) for fabrication. I've talked about [using them before](), and choose them each time. It's such an easy interface and experience:
 
 ![](https://dmckinnon.github.io/assets/nfcpre/pcbway.png)
 
 - to get a quote, just put in board dimensions and other details like colour, and approximate price is ready for you
-- to get the board itself, [export and uploading all necessary files from KiCad](https://www.pcbway.com/blog/PCB_Design_Tutorial/How_to_Export_Gerber_and_Production_Files_in_KiCad.html) - there might be some clarification but they'll help you through issues
-- board is at your door not long after. They even have the option of doing all the components for you (i still do this myself, but it's just a preference)
+- to get the board itself, [export and upload all necessary files from KiCad](https://www.pcbway.com/blog/PCB_Design_Tutorial/How_to_Export_Gerber_and_Production_Files_in_KiCad.html) - there might be some clarification but they'll help you through issues
+- board is at your door not long after. They even have the option of doing all the components for you (i still do this myself, but it's just a preference)\
+
+
 
 Here's the finished board! 
 
@@ -643,10 +637,10 @@ Here's the finished board!
 TODO add image
 <image>
 
-It's easy to flash, and I'm realy happy with Raspberry Pi for this one - holding the BOOTSEL button puts it in flashing mode and it appears as a storage device on the computer. Drag and drop the binary, it reboots, and then runs. See below for [Usage](#usage)
+It's easy to flash, and I'm really happy with Raspberry Pi for this one - holding the BOOTSEL button puts it in flashing mode and it appears as a storage device on the computer. Drag and drop the binary, it reboots, and then runs. See below for [Usage](#usage)
 
 ## Conclusion
-I'm really pleased with how this turned out. I never got to the original idea that kicked it off - using the DSP to accelerate a quantised version to reasonable speeds - but this was still fun. This started with 5.4s for generating a hundred tokens, and ended up with 1.7s.\
+I'm really pleased with how this turned out. I never got to the original idea that kicked it off - using the DSP to accelerate a quantised version to reasonable speeds - but this was still fun. This project started with more than 5 seconds for generating a hundred tokens, and ended up with 1.7s.\
 The model is definitely smaller than it could be, and considerably overfit, so it comes across as too regurgitative of the training data. But the optimisations drastically speed things up, and that proves a good initial point - I could use a much bigger model, and still get reasonable speed. \
 Other tech workers have seen this demonstrated and were delighted or impressed at the concept and execution, also proving the point that it's a useful exercise and gets the attention of a potential hiring manager. 
 
@@ -677,6 +671,8 @@ We can quibble back and forth about how much this makes this "my" project, but I
 
 ### Build and serial usage
 
+
+FIX THE BELOW NONSENSE
 ### Makefile versus CMake
 
 There are two build entry points in [PicoGPT/](PicoGPT/), targeting different
